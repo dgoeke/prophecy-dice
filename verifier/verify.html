@@ -70,49 +70,47 @@
 <h2>What this proves and what it doesn't</h2>
 <p><strong>This ledger is a commitment scheme with delayed opening.</strong> A sealed draw is
 a real commitment even though you cannot read the number yet: the tail published at session
-zero commits to the <em>entire</em> column, so a public record naming (slot, lane, position)
-pins that value irrevocably. Nobody but the GM can compute it, and the GM cannot change it —
-any preimage published later must hash forward to a tail fixed before play began.</p>
+zero commits to the entire column, so a public record naming (slot, lane, position) pins
+that value. Only the GM can compute it, and even the GM cannot change it, since any preimage
+published later must hash forward to a tail fixed before play began.</p>
 <p><strong>Sealed values are withheld because the game requires secret checks.</strong>
 Pathfinder's secret-check rule exists so a player doesn't learn their Recall Knowledge was
-a 3 and conclude the answer was unreliable. Withholding protects <em>you</em>.</p>
-<p><strong>What it proves live:</strong> fair generation <em>if the two ceremony messages
-were witnessed in order</em>: first the secret commitment, then the configuration commitment,
-then player nonces, with at least one unpredictable nonce generated on a player-controlled
-device only after the configuration was fixed. The verifier recomputes both commitments,
-but a ledger cannot prove when an external chat message was posted or how a nonce was
-generated. With that ceremony, neither side can steer values;
-custody and count (every
-draw names slot, lane, position, session, check type — positions run 1,2,3,… with no gaps);
-append-only hash-chained history; timing on a stated publish cadence; open-lane values at
-each publish; and ordered slot allocation, so the GM cannot shop among pre-read columns.</p>
-<p><strong>Keep your own nonce and the genesis head.</strong> The configuration
-commitment is posted before nonces exist, so it cannot cover them. A clumsy edit to any
-nonce breaks the ledger's hash chain immediately — but a fully rebuilt replacement ledger
-around a different player nonce cannot be told apart here until the final reveal, when the
-substituted entropy stops reproducing the published tails. Before then, only comparison
-against the genesis head you saved at session zero catches it. Genesis world and NPC nonces
-enter no derivation and get no extra recheck; they are a note for the record. A later
-activation's nonce is different: it is publicly declared and shapes that slot's columns.</p>
-<p><strong>What it can NOT prove:</strong> <em>omission is undetectable</em> — the GM's
+a 3 and conclude the answer was unreliable. The withholding protects the player.</p>
+<p><strong>What it proves live:</strong> fair generation, if the two ceremony messages were
+witnessed in order: first the secret commitment, then the configuration commitment, then
+player nonces, with at least one nonce generated on a player-controlled device after the
+configuration was fixed. The verifier recomputes both commitments, but a ledger cannot
+prove when an external chat message was posted or how a nonce was generated. Given that
+ceremony, neither side can steer values. It also proves custody and count (every draw names
+slot, lane, position, session, and check type, with positions running 1, 2, 3 and no gaps),
+an append-only hash-chained history, timing on a stated publish cadence, open-lane values
+at each publish, and ordered slot allocation, so the GM cannot shop among pre-read
+columns.</p>
+<p><strong>Keep your own nonce and the genesis head.</strong> The configuration commitment
+is posted before nonces exist, so it cannot cover them. Editing a nonce in place breaks the
+hash chain immediately, but a ledger rebuilt from scratch around a different player nonce
+passes every check here until the final reveal, when the substituted entropy stops
+reproducing the published tails. Before then, only the genesis head you saved at session
+zero catches it. Genesis world and NPC nonces enter no derivation; they are a note for the
+record. A later activation's nonce is publicly declared and shapes that slot's columns.</p>
+<p><strong>What it cannot prove:</strong> <em>omission is undetectable</em>. The GM's
 machine can read every future value at any time, and reading ahead then declining to call
-for that check consumes nothing and logs nothing. <em>Scheduling is undetectable</em> —
-arranging a pivotal scene around known-good queued values leaves no trace.
-<em>Under-reporting is not cryptographically detectable</em> — nothing forces the GM to log
-a draw. What constrains it is prompt publication plus human memory, and at this volume
-<strong>memory is weak</strong>: the count guarantee is strong for ritual draws, where each
-is announced and every abandonment is a public void, and <strong>weak for routine
-ones</strong> — nobody remembers whether session 14 held nine or eleven secret Perception
-checks. Do not read one number as covering both.</p>
-<p><strong>The compensating control is statistical audit at reveal:</strong> thousands of
-disclosed draws per player give chi-square and runs tests meaningful power; small samples
+for that check consumes nothing and logs nothing. Scheduling is likewise undetectable:
+arranging a pivotal scene around known-good queued values leaves no trace. And nothing
+forces the GM to log a draw. The only constraints on under-reporting are prompt publication
+and human memory, and at this volume <strong>memory is weak</strong>. The count guarantee
+is strong for ritual draws, where each is announced and every abandonment is a public void,
+and <strong>weak for routine ones</strong>: nobody remembers whether session 14 held nine
+or eleven secret Perception checks. Do not read one number as covering both.</p>
+<p><strong>The compensating control is statistical audit at reveal.</strong> Thousands of
+disclosed draws per player give the chi-square and runs tests real power; small samples
 would not. <code>reveal-all</code>, announce-before-draw, and ordered allocation are
 speed bumps and social ritual except where this verifier enforces them.</p>
 <p><strong>Later-activation beacon caveat:</strong> this offline file checks that the exact
-slot/lanes/nonce and a future drand round were publicly declared before the randomness was
-used. It does <em>not</em> implement drand's BLS signature verification. For every activation,
-compare the recorded chain, round, and randomness with an official drand explorer. Without
-that independent comparison, a GM-controlled beacon endpoint could invent randomness.</p>
+slot, lanes, nonce, and a future drand round were publicly declared before the randomness
+was used. It does not implement drand's BLS signature verification. Compare every
+activation's recorded chain, round, and randomness with an official drand explorer;
+without that, a GM-controlled beacon endpoint could invent randomness.</p>
 </div>
 
 <div id="report"></div>
@@ -921,7 +919,7 @@ function render(res) {
   const label = res.incomplete ? 'INCOMPLETE' : res.verdict === 'VERIFIED' ? `VERIFIED (${res.state})` : 'FAILED';
   V.append(h('div', { class: 'verdict ' + (res.incomplete ? 'inc' : res.verdict === 'VERIFIED' ? 'ok' : 'bad') }, label));
   if (res.verdict === 'VERIFIED' && res.state !== 'fully revealed')
-    V.append(h('p', {}, 'Sealed structure and custody verified. Values not yet openable — this is the normal mid-campaign state, not a deficiency: every sealed position is already an irrevocable commitment (see below).'));
+    V.append(h('p', {}, 'Sealed structure and custody verified. Values are not yet openable, which is the normal mid-campaign state: every sealed position is already a binding commitment (see below).'));
 
   // invariant checklist
   const failedInv = new Set();
@@ -956,7 +954,7 @@ function render(res) {
         h('td', {}, b.round),
         h('td', {}, h('code', {}, b.randomness))));
     }
-    R.append(h('h3', {}, 'Activation beacons — manual authenticity check required'), beacons);
+    R.append(h('h3', {}, 'Activation beacons (manual authenticity check required)'), beacons);
   }
 
   const lanes = h('table', {}, h('thead', {}, h('tr', {}, ['slot/lane', 'draws', 'voids', 'disclosed through', 'lag (draws)'].map(x => h('th', {}, x)))));
@@ -1013,7 +1011,7 @@ function render(res) {
   }
 
   // modifier cross-check (§8.4)
-  R.append(h('h2', {}, 'Modifier cross-check'), h('p', { class: 'mut' }, 'Published modifiers vs sheet-update history. Disagreements are advisory — check against your actual sheet.'));
+  R.append(h('h2', {}, 'Modifier cross-check'), h('p', { class: 'mut' }, 'Published modifiers vs sheet-update history. Disagreements are advisory; check against your actual sheet.'));
   const mc = h('table', {}, h('thead', {}, h('tr', {}, ['slot', 'check type', 'date', 'draw mod', 'sheet mod', ''].map(x => h('th', {}, x)))));
   for (const [seq, d] of M.drawRecs ?? []) {
     const e = d.entry;
@@ -1030,19 +1028,19 @@ function render(res) {
   // post-reveal audit (§8.5)
   if (res.state === 'fully revealed' && M.S) {
     R.append(h('h2', {}, 'Post-reveal audit'),
-      h('p', {}, 'Master secret opened: ', h('code', {}, hex(M.S)), ' — every root, chain, and tail recomputed from it; all published tails and previously disclosed preimages matched (invariant 25).'));
+      h('p', {}, 'Master secret opened: ', h('code', {}, hex(M.S)), '. Every root, chain, and tail was recomputed from it; all published tails and previously disclosed preimages matched (invariant 25).'));
     if (M.labels.length) R.append(h('h3', {}, 'Opened labels'), h('table', {}, M.labels.map(l => h('tr', {}, h('td', {}, h('code', {}, l.slot)), h('td', {}, l.display), h('td', {}, l.role)))));
     const stat = h('table', {}, h('thead', {}, h('tr', {}, ['slot', 'n', 'χ² (df 19)', 'p', 'runs', 'p', 'longest streak', ''].map(x => h('th', {}, x)))));
     for (const [slot, ds] of [...bySlot].sort()) {
       const rs = ds.map(d => res.rolls[d.entry.seq]).filter(r => r !== undefined);
       if (rs.length < 5) continue;
       const cs = chiSquare(rs), rt = runsTest(rs), streak = longestStreak(rs);
-      const verdictTxt = cs.p < 0.001 || (rt && rt.p < 0.001) ? 'anomalous — investigate' : 'consistent with fair dice';
+      const verdictTxt = cs.p < 0.001 || (rt && rt.p < 0.001) ? 'anomalous; investigate' : 'consistent with fair dice';
       stat.append(h('tr', {}, h('td', {}, slot), h('td', {}, rs.length), h('td', {}, cs.x2.toFixed(1)), h('td', {}, cs.p.toFixed(3)),
         h('td', {}, rt ? rt.runs : '—'), h('td', {}, rt ? rt.p.toFixed(3) : '—'), h('td', {}, streak), h('td', { class: 'mut' }, verdictTxt)));
     }
     R.append(h('h3', {}, 'Statistical tests (disclosed draws)'), stat,
-      h('p', { class: 'mut' }, 'p is the probability of a deviation at least this large from fair d20s. Small p (< 0.001) is suspicious; p near 1 is not "extra fair", just unremarkable.'));
+      h('p', { class: 'mut' }, 'p is the probability of a deviation at least this large from fair d20s. Small p (< 0.001) is suspicious; p near 1 is unremarkable.'));
     const remainderObject = Object.fromEntries([...M.remainder].sort());
     const download = h('button', {}, 'Download complete remainder JSON');
     download.addEventListener('click', () => {
@@ -1057,7 +1055,7 @@ function render(res) {
     for (const [k, rem] of [...M.remainder].sort()) {
       R.append(h('p', {}, h('code', {}, k), ` — ${rem.length} unconsumed: `, h('span', { class: 'mono' }, rem.slice(0, 20).join(' ') + (rem.length > 20 ? ' …' : ''))));
     }
-    if (M.neverActivated.length) R.append(h('p', { class: 'mut' }, `Slots never activated: ${M.neverActivated.join(', ')}. Their columns were never fixed — activation mixes in a randomness-beacon round that never happened, so there is nothing to open. The reservation itself (ordered, committed at genesis) is what they contributed.`));
+    if (M.neverActivated.length) R.append(h('p', { class: 'mut' }, `Slots never activated: ${M.neverActivated.join(', ')}. Activation mixes in a beacon round that never happened, so their columns were never fixed and there is nothing to open. What they contributed is the ordered reservation committed at genesis.`));
   }
 }
 

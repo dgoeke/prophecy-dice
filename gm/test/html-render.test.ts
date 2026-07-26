@@ -51,7 +51,7 @@ describe('verify.html rendering', () => {
     col.render(res);
     const verdict = document.getElementById('verdict')!.textContent!;
     expect(verdict).toContain('VERIFIED (sealed)');
-    expect(verdict).toContain('not a deficiency');
+    expect(verdict).toContain('normal mid-campaign state');
     const report = document.getElementById('report')!.textContent!;
     expect(report).toContain('sealed');
   });
