@@ -1,0 +1,75 @@
+/*
+ * Prophecy Dice — design tokens.
+ *
+ * The organizing rule is RUBRICATION: like a scriptorium ledger, the body is
+ * iron-gall ink and red is reserved for ceremony and the irreversible —
+ * announce/reveal, voids, reveal-all, corrections. Red never means "error".
+ * Sealed things wear lead-seal blue; open/disclosed things wear verdigris;
+ * numerals and armed states wear candlelit brass.
+ */
+
+:root {
+  --paper: #171411;        /* iron-gall black, warm */
+  --paper-2: #1f1b16;      /* raised surface */
+  --paper-3: #292219;      /* armed / hover surface */
+  --line: #382f24;
+  --line-soft: #292319;
+  --ink: #e7ddc9;          /* parchment */
+  --ink-dim: #a2957f;
+  --ink-faint: #6f6452;
+  --rubric: #c2402e;       /* vermilion — ceremony, the irreversible */
+  --rubric-deep: #8a2f22;
+  --rubric-wash: #331d17;
+  --seal: #8fa8c4;         /* lead seal — sealed lanes and values */
+  --seal-dim: #4c5a6b;
+  --verdigris: #82b092;    /* open, disclosed, verified */
+  --verdigris-dim: #435c4c;
+  --brass: #d3a95c;        /* numerals, results, armed */
+  --brass-dim: #7a6338;
+  --amber: #c9973b;        /* warnings: consumption, unpublished */
+  --plum: #9c7fae;         /* the deep lane — highly sensitive checks */
+  --ash: #4a4136;          /* the consumed part of a column */
+
+  --font-ceremony: 'EB Garamond', Georgia, 'Times New Roman', serif;
+  --font-ui: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-data: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+
+  --r: 4px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 15px/1.5 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+#root { min-height: 100vh; display: flex; flex-direction: column; }
+
+h1, h2, h3 { font-weight: 600; margin: 0 0 .5rem; }
+h2 { font-size: 1.05rem; letter-spacing: .01em; }
+a { color: var(--ink); }
+button { font: inherit; color: inherit; cursor: pointer; }
+input, select, textarea { font: inherit; }
+code, .mono { font-family: var(--font-data); font-size: .86em; }
+
+:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; border-radius: 2px; }
+::selection { background: var(--brass-dim); }
+
+.eyebrow {
+  font: 500 .68rem/1 var(--font-data);
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.dim { color: var(--ink-dim); }
+.faint { color: var(--ink-faint); }
+.brass { color: var(--brass); }
+.rubric { color: var(--rubric); }
+.sealed-c { color: var(--seal); }
+.open-c { color: var(--verdigris); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

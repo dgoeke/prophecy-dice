@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<!--
+  Prophecy Dice — player verifier.  wotw-column/1, ledger format wotw-column-ledger/4.
+
+  Single file, zero dependencies, no build step. Works from file:// and static
+  hosting. Makes no network request except fetching the ledger you point it at.
+
+  How to trace a disclosed value from ledger entry to verified result:
+    1. A `draw` entry names (slot, lane, position). It contains NO value —
+       the tail published at genesis commits to the whole column, so the
+       position IS the commitment (spec §5.5).
+    2. A later `disclose` entry gives `preimage` for `through_position`.
+       verifyLedger() hashes it forward through_position times with TAG_CHAIN
+       and compares against the lane's tail (§2.13) — see the `disclose` case.
+    3. The preimage for your draw's position is chainStep applied
+       (through_position − position) times. rollFromPreimage() turns it into
+       the d20 result: 1 + (SHA256(TAG_DIE ‖ p) as a big-endian int mod 20).
+    4. Sealed DCs/modifiers/contexts open in the same entry: their salts
+       derive from the preimage and the committing entry's seq (§2.12), so
+       commitOf() recomputes the published commitment from the opened value.
+-->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prophecy Dice — verifier</title>
+<style>
+  :root { --ok:#1a7f37; --bad:#c62828; --warn:#b26a00; --mut:#666; --line:#ddd; }
+  * { box-sizing:border-box; }
+  body { font:15px/1.45 system-ui,sans-serif; margin:0 auto; max-width:64rem; padding:0 .8rem 4rem; color:#1a1a1a; background:#fff; }
+  h1 { font-size:1.3rem; } h2 { font-size:1.1rem; margin:1.6rem 0 .5rem; border-bottom:1px solid var(--line); }
+  h3 { font-size:1rem; margin:1rem 0 .3rem; }
+  code, .mono { font-family:ui-monospace,monospace; font-size:.85em; word-break:break-all; }
+  table { border-collapse:collapse; width:100%; font-size:.85rem; }
+  th, td { text-align:left; padding:.15rem .5rem .15rem 0; vertical-align:top; }
+  thead th { border-bottom:1px solid var(--line); }
+  .verdict { font-size:1.6rem; font-weight:700; padding:.6rem .9rem; border-radius:.4rem; margin:.8rem 0; }
+  .verdict.ok { background:#e6f4ea; color:var(--ok); } .verdict.bad { background:#fdecea; color:var(--bad); }
+  .verdict.inc { background:#fff4e5; color:var(--warn); }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .mut { color:var(--mut); }
+  .sealed { color:var(--mut); font-style:italic; }
+  .invgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(15rem,1fr)); gap:.1rem .8rem; font-size:.85rem; }
+  .failmsg { font-family:ui-monospace,monospace; font-size:.8rem; color:var(--bad); margin:.1rem 0 .1rem 1rem; }
+  #panel { border:2px solid #1a1a1a; border-radius:.4rem; padding:.2rem 1rem; margin:1rem 0; background:#fafafa; }
+  #panel h2 { border:none; margin-top:.6rem; }
+  .bars { display:flex; align-items:flex-end; gap:1px; height:3.2rem; margin:.3rem 0; }
+  .bars div { flex:1; background:#7595c9; min-height:1px; position:relative; }
+  .bars div span { position:absolute; top:100%; left:0; right:0; text-align:center; font-size:.55rem; color:var(--mut); }
+  .corrected { text-decoration:line-through; text-decoration-color:var(--bad); }
+  textarea { width:100%; height:6rem; font-family:ui-monospace,monospace; font-size:.8rem; }
+  details { margin:.4rem 0; } summary { cursor:pointer; font-weight:600; }
+  .statusline { color:var(--mut); font-size:.85rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background:#161616; color:#e4e4e4; } :root { --line:#3a3a3a; --mut:#9a9a9a; }
+    #panel { background:#1e1e1e; border-color:#e4e4e4; }
+    .verdict.ok { background:#12351d; color:#5fca7e; } .verdict.bad { background:#3d1513; color:#ff8a80; }
+    .verdict.inc { background:#38290f; color:#ffb74d; }
+  }
+</style>
+</head><body>
+<h1>Prophecy Dice — verifier</h1>
+<p class="mut">Verifies a <code>wotw-column-ledger/4</code> ledger. Load via
+<code>?ledger=&lt;url&gt;</code>, the file picker, or paste.</p>
+<p><input type="file" id="filepick" accept=".json,application/json">
+<button id="pastebtn">Verify pasted JSON</button></p>
+<textarea id="paste" placeholder='{"format":"wotw-column-ledger/4", ...}'></textarea>
+<p class="statusline" id="status"></p>
+
+<div id="verdict"></div>
+
+<div id="panel">
+<h2>What this proves and what it doesn't</h2>
+<p><strong>This ledger is a commitment scheme with delayed opening.</strong> A sealed draw is
+a real commitment even though you cannot read the number yet: the tail published at session
+zero commits to the <em>entire</em> column, so a public record naming (slot, lane, position)
+pins that value irrevocably. Nobody but the GM can compute it, and the GM cannot change it —
+any preimage published later must hash forward to a tail fixed before play began.</p>
+<p><strong>Sealed values are withheld because the game requires secret checks.</strong>
+Pathfinder's secret-check rule exists so a player doesn't learn their Recall Knowledge was
+a 3 and conclude the answer was unreliable. Withholding protects <em>you</em>.</p>
+<p><strong>What it proves live:</strong> fair generation <em>if the two ceremony messages
+were witnessed in order</em>: first the secret commitment, then the configuration commitment,
+then player nonces, with at least one unpredictable nonce generated on a player-controlled
+device only after the configuration was fixed. The verifier recomputes both commitments,
+but a ledger cannot prove when an external chat message was posted or how a nonce was
+generated. With that ceremony, neither side can steer values;
+custody and count (every
+draw names slot, lane, position, session, check type — positions run 1,2,3,… with no gaps);
+append-only hash-chained history; timing on a stated publish cadence; open-lane values at
+each publish; and ordered slot allocation, so the GM cannot shop among pre-read columns.</p>
+<p><strong>Keep your own nonce and the genesis head.</strong> The configuration
+commitment is posted before nonces exist, so it cannot cover them. A clumsy edit to any
+nonce breaks the ledger's hash chain immediately — but a fully rebuilt replacement ledger
+around a different player nonce cannot be told apart here until the final reveal, when the
+substituted entropy stops reproducing the published tails. Before then, only comparison
+against the genesis head you saved at session zero catches it. Genesis world and NPC nonces
+enter no derivation and get no extra recheck; they are a note for the record. A later
+activation's nonce is different: it is publicly declared and shapes that slot's columns.</p>
+<p><strong>What it can NOT prove:</strong> <em>omission is undetectable</em> — the GM's
+machine can read every future value at any time, and reading ahead then declining to call
+for that check consumes nothing and logs nothing. <em>Scheduling is undetectable</em> —
+arranging a pivotal scene around known-good queued values leaves no trace.
+<em>Under-reporting is not cryptographically detectable</em> — nothing forces the GM to log
+a draw. What constrains it is prompt publication plus human memory, and at this volume
+<strong>memory is weak</strong>: the count guarantee is strong for ritual draws, where each
+is announced and every abandonment is a public void, and <strong>weak for routine
+ones</strong> — nobody remembers whether session 14 held nine or eleven secret Perception
+checks. Do not read one number as covering both.</p>
+<p><strong>The compensating control is statistical audit at reveal:</strong> thousands of
+disclosed draws per player give chi-square and runs tests meaningful power; small samples
+would not. <code>reveal-all</code>, announce-before-draw, and ordered allocation are
+speed bumps and social ritual except where this verifier enforces them.</p>
+<p><strong>Later-activation beacon caveat:</strong> this offline file checks that the exact
+slot/lanes/nonce and a future drand round were publicly declared before the randomness was
+used. It does <em>not</em> implement drand's BLS signature verification. For every activation,
+compare the recorded chain, round, and randomness with an official drand explorer. Without
+that independent comparison, a GM-controlled beacon endpoint could invent randomness.</p>
+</div>
+
+<div id="report"></div>
+
+<script>
+'use strict';
+// ============================ byte helpers ==================================
+const te = new TextEncoder();
+const utf8 = s => te.encode(s);
+const hex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+const unhex = s => new Uint8Array(s.match(/../g).map(x => parseInt(x, 16)));
+const cat = (...bs) => { const o = new Uint8Array(bs.reduce((n, b) => n + b.length, 0)); let p = 0; for (const b of bs) { o.set(b, p); p += b.length; } return o; };
+
+// ==================== synchronous SHA-256 (FIPS 180-4) ======================
+// Compact well-known construction. crypto.subtle is promise-based and would
+// hang the tab across hundreds of thousands of sequential chain steps (§8.6);
+// this sync version does the bulk walking and is cross-checked against
+// WebCrypto at startup where available.
+const K256 = new Uint32Array([
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+function sha256(msg) {
+  const len = msg.length, bits = len * 8;
+  const pad = new Uint8Array((((len + 8) >> 6) + 1) << 6);
+  pad.set(msg); pad[len] = 0x80;
+  const dv = new DataView(pad.buffer);
+  dv.setUint32(pad.length - 8, Math.floor(bits / 0x100000000));
+  dv.setUint32(pad.length - 4, bits >>> 0);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const W = new Uint32Array(64);
+  for (let off = 0; off < pad.length; off += 64) {
+    for (let i = 0; i < 16; i++) W[i] = dv.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(W[i-15],7) ^ rotr(W[i-15],18) ^ (W[i-15] >>> 3);
+      const s1 = rotr(W[i-2],17) ^ rotr(W[i-2],19) ^ (W[i-2] >>> 10);
+      W[i] = (W[i-16] + s0 + W[i-7] + s1) | 0;
+    }
+    let a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (rotr(e,6)^rotr(e,11)^rotr(e,25)) + ((e&f)^(~e&g)) + K256[i] + W[i]) | 0;
+      const t2 = ((rotr(a,2)^rotr(a,13)^rotr(a,22)) + ((a&b)^(a&c)^(b&c))) | 0;
+      h=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
+    }
+    H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
+    H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, H[i] >>> 0);
+  return out;
+}
+// HMAC-SHA256 and HKDF-SHA256 (RFC 5869, extract-then-expand, full form).
+function hmac(key, msg) {
+  if (key.length > 64) key = sha256(key);
+  const ip = new Uint8Array(64), op = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { ip[i] = (key[i] || 0) ^ 0x36; op[i] = (key[i] || 0) ^ 0x5c; }
+  return sha256(cat(op, sha256(cat(ip, msg))));
+}
+function hkdf(ikm, salt, info, len) {
+  const prk = hmac(salt, ikm);
+  const out = new Uint8Array(len);
+  let t = new Uint8Array(0);
+  for (let i = 1, pos = 0; pos < len; i++, pos += 32) {
+    t = hmac(prk, cat(t, info, Uint8Array.of(i)));
+    out.set(t.subarray(0, Math.min(32, len - pos)), pos);
+  }
+  return out;
+}
+
+// ======================= canonical JSON (§2.3) ==============================
+function cmpCodePoints(a, b) {
+  const A = Array.from(a), B = Array.from(b), n = Math.min(A.length, B.length);
+  for (let i = 0; i < n; i++) {
+    const d = A[i].codePointAt(0) - B[i].codePointAt(0);
+    if (d) return d;
+  }
+  return A.length - B.length;
+}
+function escStr(s) {
+  let o = '"';
+  for (const ch of s) {
+    if (ch === '"') o += '\\"';
+    else if (ch === '\\') o += '\\\\';
+    else if (ch.codePointAt(0) < 0x20) o += '\\u00' + ch.codePointAt(0).toString(16).padStart(2, '0');
+    else o += ch;
+  }
+  return o + '"';
+}
+function canonical(v) {
+  if (v === null) return 'null';
+  if (v === true) return 'true';
+  if (v === false) return 'false';
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v) || Math.abs(v) > 2 ** 53) throw Error('canonical: bad number ' + v);
+    return String(Object.is(v, -0) ? 0 : v);
+  }
+  if (typeof v === 'string') return escStr(v.normalize('NFC'));
+  if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+  if (typeof v === 'object') {
+    const es = Object.entries(v).map(([k, x]) => [k.normalize('NFC'), x]).sort((x, y) => cmpCodePoints(x[0], y[0]));
+    for (let i = 1; i < es.length; i++) if (es[i][0] === es[i-1][0]) throw Error('canonical: duplicate key');
+    return '{' + es.map(([k, x]) => escStr(k) + ':' + canonical(x)).join(',') + '}';
+  }
+  throw Error('canonical: unsupported type');
+}
+const canonicalBytes = v => utf8(canonical(v));
+
+// ======================= protocol crypto (§2) ===============================
+const TAG_CHAIN = utf8('wotw-column/1/chain'), TAG_DIE = utf8('wotw-column/1/die/20');
+const TAG_DC = utf8('wotw-column/1/dc'), TAG_MOD = utf8('wotw-column/1/mod');
+const TAG_CTXC = utf8('wotw-column/1/context'), TAG_LABEL = utf8('wotw-column/1/label');
+const TAG_ENTROPY = utf8('wotw-column/1/genesis-entropy');
+const TAG_CONFIG = utf8('wotw-column/1/genesis-configuration');
+const TAG_S_DC = utf8('wotw-column/1/salt/dc'), TAG_S_MOD = utf8('wotw-column/1/salt/mod');
+const TAG_S_CTX = utf8('wotw-column/1/salt/context');
+const SALT = utf8('wotw-column/1/salt'), INFO_PREFIX = 'wotw-column/1/slot/';
+const chainStep = x => sha256(cat(TAG_CHAIN, x));
+function rollFromPreimage(p) {
+  const d = sha256(cat(TAG_DIE, p));
+  let acc = 0;
+  for (const b of d) acc = (acc * 256 + b) % 20;
+  return 1 + acc;
+}
+const laneRoot = (ikm, slot, lane) => hkdf(ikm, SALT, utf8(INFO_PREFIX + slot + '/' + lane), 32);
+function genesisEntropy(transcript) {
+  const nonces = (transcript?.slots ?? [])
+    .filter(s => s?.status === 'active' && s?.role === 'player')
+    .map(s => {
+      if (typeof s.nonce !== 'string' || !s.nonce) throw Error('missing player nonce');
+      return s.nonce.normalize('NFC');
+    });
+  if (!nonces.length) throw Error('missing player nonce');
+  nonces.sort((a, b) => {
+    const A = utf8(a), B = utf8(b), n = Math.min(A.length, B.length);
+    for (let i = 0; i < n; i++) if (A[i] !== B[i]) return A[i] - B[i];
+    return A.length - B.length;
+  });
+  return sha256(cat(TAG_ENTROPY, canonicalBytes(nonces)));
+}
+function genesisConfiguration(transcript) {
+  return {
+    version: transcript?.version, commitment: transcript?.commitment,
+    chain_length: transcript?.chain_length, campaign: transcript?.campaign,
+    context_privacy: transcript?.context_privacy,
+    disclosure_policy: transcript?.disclosure_policy,
+    check_types: transcript?.check_types,
+    slots: (transcript?.slots ?? []).map(s => ({
+      id: s?.id, display: s?.display, role: s?.role, status: s?.status,
+      lanes: s?.lanes, nonce: null,
+    })),
+    beacon: transcript?.beacon,
+  };
+}
+const configurationCommitment = transcript =>
+  hex(sha256(cat(TAG_CONFIG, canonicalBytes(genesisConfiguration(transcript)))));
+const labelSalt = (S, E, slot) => hkdf(cat(S, E), SALT, utf8(INFO_PREFIX + slot + '/#label'), 32);
+// §2.12 — salts derive from the concerned preimage and the committing seq.
+const fieldSalt = (tag, p, seq) => sha256(cat(tag, p, utf8(String(seq))));
+const dcCommitOf = (p, seq, dc) => hex(sha256(cat(TAG_DC, fieldSalt(TAG_S_DC, p, seq), utf8(String(dc)))));
+const modCommitOf = (p, seq, m) => hex(sha256(cat(TAG_MOD, fieldSalt(TAG_S_MOD, p, seq), utf8(String(m)))));
+const ctxCommitOf = (p, seq, c) => hex(sha256(cat(TAG_CTXC, fieldSalt(TAG_S_CTX, p, seq), utf8(c.normalize('NFC')))));
+const labelCommitOf = (salt, display, role) => hex(sha256(cat(TAG_LABEL, salt, canonicalBytes({ display, role }))));
+function degreeOf(roll, mod, dc) { // §2.14 — compare total first, then shift
+  const t = roll + mod;
+  let d = t >= dc + 10 ? 3 : t >= dc ? 2 : t <= dc - 10 ? 0 : 1;
+  if (roll === 20) d = Math.min(d + 1, 3);
+  if (roll === 1) d = Math.max(d - 1, 0);
+  return d;
+}
+const DEGREES = ['critical failure', 'failure', 'success', 'critical success'];
+
+// ===================== ledger verification (§3.3) ===========================
+// Failure messages are byte-identical to gm/core/verify.ts and verify.py:
+// the negative test vectors in spec/vectors.json are the arbiter.
+const ZERO64 = '0'.repeat(64), FORMAT = 'wotw-column-ledger/4';
+const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/, HEX64 = /^[0-9a-f]{64}$/;
+const LANE_RE = /^[a-z][a-z0-9-]{0,31}$/;
+const KNOWN_CHAINS = {
+  'drand:8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce': { genesis_time: 1595431050, period: 30 },
+  'drand:52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971': { genesis_time: 1692803367, period: 3 },
+};
+const REQUIRED = {
+  'genesis': ['transcript', 'tails'], 'session-open': [], 'session-close': [],
+  'note': ['text'], 'reveal-all': ['scope'],
+  'announce': ['slot', 'lane', 'check_type', 'initiator'],
+  'draw': ['slot', 'lane', 'position', 'check_type', 'initiator'],
+  'void': ['slot', 'lane', 'announce_seq', 'reason'],
+  'correction': ['target_seq', 'reason'], 'dc-late': ['target_seq'],
+  'out-of-band': ['check_type', 'result', 'reason'],
+  'disclose': ['slot', 'lane', 'through_position', 'preimage', 'opened'],
+  'sheet-update': ['slot', 'effective_from', 'modifiers'],
+  'check-type': ['op', 'check_type'], 'activation-declare': ['declaration'],
+  'activate': ['activation_record', 'tails'],
+  'lane-add': ['slot', 'lane', 'tail'], 'retire-slot': ['slot', 'reason'],
+  'final-reveal': ['secret', 'labels'], 'closed': ['reason'],
+};
+const ENTRY_FIELDS = {
+  genesis: ['transcript','tails'], 'session-open': [], 'session-close': [],
+  announce: ['slot','lane','check_type','initiator','context','context_commit','dc','dc_commit'],
+  draw: ['slot','lane','position','check_type','initiator','modifier','mod_commit','context','context_commit','dc','dc_commit','announce_seq','batch','paired_with','pair_rule','gm_degree'],
+  void: ['slot','lane','announce_seq','reason'], correction: ['target_seq','reason','replacement_seq'],
+  'dc-late': ['target_seq','dc','dc_commit'], 'out-of-band': ['check_type','slot','result','reason'],
+  disclose: ['slot','lane','through_position','preimage','opened'],
+  'sheet-update': ['slot','effective_from','modifiers'], 'check-type': ['op','check_type'],
+  'activation-declare': ['declaration'], activate: ['activation_record','tails'],
+  'lane-add': ['slot','lane','tail'], 'retire-slot': ['slot','reason'],
+  note: ['text'], 'reveal-all': ['scope'], 'final-reveal': ['secret','labels'], closed: ['reason'],
+};
+const COMMON_FIELDS = new Set(['seq','ts','session','kind','prev','hash']);
+const entryHashOf = e => { const { hash, ...rest } = e; return hex(sha256(canonicalBytes(rest))); };
+const isInt = v => Number.isInteger(v);
+const validTs = v => typeof v === 'string' && TS_RE.test(v) && Number.isFinite(Date.parse(v))
+  && new Date(v).toISOString().replace('.000Z', 'Z') === v;
+const validDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
+  && Number.isFinite(Date.parse(v + 'T00:00:00Z'))
+  && new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) === v;
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+async function verifyLedger(file, progress) {
+  const F = [], fail = m => F.push(m), rolls = {};
+  const M = { // model for rendering: everything the report sections need
+    perLane: new Map(), voids: new Map(), corrections: new Set(), replacements: new Map(),
+    oob: [], revealAlls: [], activations: [], sheets: [], regEvents: [], notes: [],
+    opened: new Map(), dcLateOf: new Map(), pairs: [], labels: [], remainder: new Map(),
+    neverActivated: [], slots: new Map(), transcript: null, lastTs: null, S: null,
+  };
+  const res = { verdict: 'FAILED', state: 'sealed', failures: F, entries: 0, rolls, model: M, incomplete: false };
+  if (!file || typeof file !== 'object' || !Array.isArray(file.entries)) {
+    fail('structure: not a ledger file'); res.incomplete = true; return res;
+  }
+  for (const k of Object.keys(file)) {
+    if (!['format','head','entries'].includes(k)) fail(`structure: unexpected ledger field ${k}`);
+  }
+  if (file.format !== FORMAT) { fail(`structure: format is ${file.format}, expected ${FORMAT}`); res.incomplete = true; }
+  const entries = file.entries;
+  res.entries = entries.length;
+
+  // -- pass 1: structural invariants 1–5 --
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.seq !== i) fail(`inv 1: entry at index ${i} has seq ${e.seq}, expected ${i}`);
+    if (i === 0) { if (e.kind !== 'genesis') fail(`inv 2: entry 0 kind is ${e.kind}, expected genesis`); }
+    else if (e.kind === 'genesis') fail(`inv 2: entry ${e.seq} is a second genesis`);
+    if (e.prev !== (i === 0 ? ZERO64 : entries[i-1].hash)) fail(`inv 3: seq ${e.seq} prev does not match hash of seq ${i-1}`);
+    try { if (entryHashOf(e) !== e.hash) fail(`inv 4: seq ${e.seq} hash does not recompute`); }
+    catch { fail(`inv 4: seq ${e.seq} hash does not recompute`); }
+    if (!validTs(e.ts)) fail(`structure: seq ${e.seq} bad ts`);
+    else if (i > 0 && typeof entries[i-1].ts === 'string' && e.ts < entries[i-1].ts) fail(`inv 5: seq ${e.seq} ts decreases`);
+    if (i % 500 === 499) { progress?.(`checking hashes… ${i + 1}/${entries.length}`); await tick(); }
+  }
+  if (entries.length && file.head !== entries[entries.length-1].hash) fail('structure: head does not match last entry hash');
+  if (!entries.length) { fail('structure: empty ledger'); res.incomplete = true; return res; }
+  M.lastTs = entries[entries.length-1].ts;
+
+  // -- semantic state --
+  let transcript = null, chainLen = 0, activatedCount = 0, sawDisclose = false, finalReveal = null, closedSeq = null;
+  let currentSession = 0, sessionOpen = false, pendingActivation = null;
+  const registry = new Map(), slots = M.slots, actRecords = new Map(), deferredQ = [];
+  const tails = new Map(), cursor = new Map(), maxConc = new Map(), carriers = new Map();
+  const drawsByLane = new Map(), drawRecs = new Map(), openAnns = new Map(), pairedRefs = new Set();
+  const dcLates = new Set(), batches = new Map(), watermark = new Map(), openedSeqs = new Set(), discloses = [];
+  const pendingSheetUpdates = [];
+  const key = (s, l) => `${s}/${l}`;
+  const bump = (m, k, v) => m.set(k, Math.max(m.get(k) ?? 0, v));
+  const addCarrier = (k, c) => { if (Object.keys(c.commits).length) (carriers.get(k) ?? carriers.set(k, []).get(k)).push(c); };
+  const exactKeys = (obj, expected, where) => {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { fail(`structure: ${where} is not an object`); return false; }
+    if (Object.keys(obj).sort().join() !== [...expected].sort().join()) {
+      fail(`structure: ${where} has unexpected or missing fields`); return false;
+    }
+    return true;
+  };
+  const leak = e => { for (const f of Object.keys(e)) if (f === 'link' || f === 'result' || f.includes('salt')) fail(`inv 20: seq ${e.seq} forbidden field ${f}`); };
+  const typing = (e, st) => { // inv-10 family, shared by draw and announce
+    if (!st) { fail(`inv 18: seq ${e.seq} draw for inactive slot ${e.slot}`); return null; }
+    if (st.retired) fail(`inv 15: seq ${e.seq} draw for retired slot ${e.slot}`);
+    else if (!st.active) fail(`inv 18: seq ${e.seq} draw for inactive slot ${e.slot}`);
+    const t = registry.get(e.check_type);
+    if (!t) { fail(`inv 10: seq ${e.seq} unknown check_type ${e.check_type}`); return null; }
+    if (e.lane !== t.lane) fail(`inv 10: seq ${e.seq} lane ${e.lane} does not match check_type ${e.check_type} lane ${t.lane}`);
+    if (st.lanes && !st.lanes.has(e.lane)) fail(`inv 10: seq ${e.seq} slot ${e.slot} does not declare lane ${e.lane}`);
+    if (st.role !== null && !t.roles.includes(st.role)) fail(`inv 10: seq ${e.seq} slot role ${st.role} not in roles of check_type ${e.check_type}`);
+    return t;
+  };
+  const sealForms = (e, t) => {
+    if (t.seal_dc && 'dc' in e) fail(`seal: seq ${e.seq} field dc form contradicts registry`);
+    if (!t.seal_dc && 'dc_commit' in e) fail(`seal: seq ${e.seq} field dc form contradicts registry`);
+    if (t.seal_modifier && 'modifier' in e) fail(`seal: seq ${e.seq} field modifier form contradicts registry`);
+    if (!t.seal_modifier && 'mod_commit' in e) fail(`seal: seq ${e.seq} field modifier form contradicts registry`);
+    const sc = transcript?.context_privacy === 'sealed';
+    if (sc && 'context' in e) fail(`seal: seq ${e.seq} field context form contradicts registry`);
+    if (!sc && 'context_commit' in e) fail(`seal: seq ${e.seq} field context form contradicts registry`);
+    for (const f of ['dc_commit', 'mod_commit', 'context_commit'])
+      if (f in e && (typeof e[f] !== 'string' || !HEX64.test(e[f]))) fail(`structure: seq ${e.seq} malformed ${f}`);
+    if ('dc' in e && !isInt(e.dc)) fail(`structure: seq ${e.seq} malformed dc`);
+    if ('modifier' in e && !isInt(e.modifier)) fail(`structure: seq ${e.seq} malformed modifier`);
+    if ('context' in e && typeof e.context !== 'string') fail(`structure: seq ${e.seq} malformed context`);
+  };
+
+  // -- pass 2: semantic walk --
+  for (const e of entries) {
+    const req = REQUIRED[e.kind];
+    if (req === undefined) { fail(`structure: seq ${e.seq} unknown kind ${typeof e.kind === 'string' ? e.kind : '?'}`); continue; }
+    const miss = req.filter(f => !(f in e));
+    if (miss.length) { fail(`structure: seq ${e.seq} missing field ${miss[0]}`); continue; }
+    const allowed = new Set([...COMMON_FIELDS, ...ENTRY_FIELDS[e.kind]]);
+    for (const field of Object.keys(e)) if (!allowed.has(field)) fail(`structure: seq ${e.seq} unexpected field ${field}`);
+    const expectedSession = e.kind === 'session-open' ? currentSession + 1 : currentSession;
+    if (!isInt(e.session) || e.session !== expectedSession)
+      fail(`structure: seq ${e.seq} session ${e.session} does not match ledger state`);
+    if (finalReveal !== null && e.kind !== 'closed') fail(`structure: seq ${e.seq} entry after final-reveal`);
+    if (pendingActivation !== null && e.kind !== 'activate')
+      fail(`structure: seq ${e.seq} must complete activation declared at seq ${pendingActivation.seq}`);
+
+    if (e.kind === 'genesis') {
+      if (e.seq !== 0) continue;
+      transcript = M.transcript = e.transcript;
+      if (typeof transcript !== 'object' || transcript === null) { fail('structure: genesis transcript missing'); transcript = null; continue; }
+      exactKeys(transcript, ['version','commitment','chain_length','created_at','campaign','context_privacy','disclosure_policy','check_types','slots','beacon','configuration_commitment'], 'genesis transcript');
+      if (typeof transcript.commitment !== 'string' || !HEX64.test(transcript.commitment)) fail('inv 6: commitment is not 64 lowercase hex');
+      if (transcript.version !== 'wotw-column/1') fail('structure: unsupported transcript version');
+      if (typeof transcript.campaign !== 'string' || !transcript.campaign
+          || typeof transcript.disclosure_policy !== 'string' || !transcript.disclosure_policy
+          || !['plain','sealed'].includes(transcript.context_privacy) || !validTs(transcript.created_at)
+          || transcript.beacon !== null)
+        fail('structure: malformed genesis transcript metadata');
+      {
+        // recomputation canonicalizes GM-supplied structure and can throw on
+        // malformed input; unhashable can never match
+        let configOk = false;
+        try { configOk = transcript.configuration_commitment === configurationCommitment(transcript); }
+        catch { configOk = false; }
+        if (!configOk) fail('structure: genesis configuration commitment mismatch');
+      }
+      chainLen = transcript.chain_length ?? 0;
+      if (!isInt(chainLen) || chainLen < 1 || chainLen > 1000000) { fail('structure: bad chain_length'); chainLen = 0; }
+      if (!Array.isArray(transcript.check_types) || !transcript.check_types.length) fail('structure: genesis check_types missing');
+      for (const t of (Array.isArray(transcript.check_types) ? transcript.check_types : [])) {
+        const ok = exactKeys(t, ['id','label','lane','roles','seal_dc','seal_modifier','ritual'], `genesis check_type ${t?.id ?? ''}`);
+        if (!ok || typeof t.id !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(t.id) || registry.has(t.id)
+            || typeof t.label !== 'string' || !LANE_RE.test(t.lane) || !Array.isArray(t.roles) || !t.roles.length
+            || t.roles.some(r => !['player','npc','world'].includes(r)) || typeof t.seal_dc !== 'boolean'
+            || typeof t.seal_modifier !== 'boolean' || typeof t.ritual !== 'boolean')
+          fail(`structure: malformed genesis check_type ${typeof t?.id === 'string' ? t.id : ''}`);
+        else registry.set(t.id, t);
+      }
+      if (!Array.isArray(transcript.slots) || !transcript.slots.length) fail('structure: genesis slots missing');
+      // normalize before iterating: a non-array survives the check above
+      const transcriptSlots = Array.isArray(transcript.slots) ? transcript.slots : [];
+      for (let si = 0; si < transcriptSlots.length; si++) {
+        const s = transcriptSlots[si], expectedId = `slot-${String(si + 1).padStart(2, '0')}`;
+        if (!s || s.id !== expectedId || !['active','deferred'].includes(s.status)) {
+          fail(`structure: genesis slot ${si} malformed or out of order`); continue;
+        }
+        if (s.status === 'active') {
+          const ok = exactKeys(s, ['id','display','role','status','lanes','nonce'], `genesis active slot ${s.id}`);
+          if (!ok || !['player','npc','world'].includes(s.role) || typeof s.display !== 'string'
+              || typeof s.nonce !== 'string' || !s.nonce || !Array.isArray(s.lanes) || !s.lanes.length
+              || new Set(s.lanes).size !== s.lanes.length || s.lanes.some(l => !LANE_RE.test(String(l)))) {
+            fail(`structure: genesis active slot ${s.id} malformed`); continue;
+          }
+          slots.set(s.id, { role: s.role, display: s.display, lanes: new Set(s.lanes), active: true, retired: false, A: null });
+          for (const lane of s.lanes) {
+            const tl = e.tails?.[s.id]?.[lane];
+            if (typeof tl !== 'string' || !HEX64.test(tl)) fail(`structure: genesis missing tail for ${s.id}/${lane}`);
+            else tails.set(key(s.id, lane), tl);
+          }
+        } else {
+          const ok = exactKeys(s, ['id','display','role','status','lanes','nonce'], `genesis deferred slot ${s.id}`);
+          if (!ok || s.role !== null || s.display !== null || s.lanes !== null || s.nonce !== null)
+            fail(`structure: genesis deferred slot ${s.id} is not empty`);
+          slots.set(s.id, { role: null, display: null, lanes: null, active: false, retired: false, A: null }); deferredQ.push(s.id);
+        }
+      }
+      // the tails object must cover exactly the active slots and their lanes
+      const activeSlots = transcriptSlots.filter(s => s?.status === 'active');
+      if (Object.keys(e.tails ?? {}).sort().join() !== activeSlots.map(s => s.id).sort().join())
+        fail('structure: genesis tails do not match active slots');
+      for (const s of activeSlots) {
+        const laneKeys = Object.keys(e.tails?.[s.id] ?? {}).sort();
+        if (!Array.isArray(s.lanes) || laneKeys.join() !== [...s.lanes].sort().join())
+          fail(`structure: genesis tails do not match lanes of ${s.id}`);
+      }
+      try { genesisEntropy(transcript); } catch { fail('structure: genesis player entropy missing'); }
+    } else if (e.kind === 'session-open') {
+      if (sessionOpen) fail(`structure: seq ${e.seq} session-open while a session is open`);
+      currentSession = e.session; sessionOpen = true;
+    } else if (e.kind === 'session-close') {
+      if (!sessionOpen) fail(`structure: seq ${e.seq} session-close while no session is open`);
+      sessionOpen = false;
+    } else if (e.kind === 'note') {
+      if (typeof e.text !== 'string' || !e.text.trim()) fail(`structure: seq ${e.seq} malformed note`);
+      M.notes.push(e);
+    } else if (e.kind === 'reveal-all') {
+      if (typeof e.scope !== 'string' || !e.scope.trim()) fail(`structure: seq ${e.seq} malformed reveal-all`);
+      M.revealAlls.push(e);
+    } else if (e.kind === 'sheet-update') {
+      const st = slots.get(e.slot);
+      if (!st || !st.active || st.retired) fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
+      else if (st.role === null) pendingSheetUpdates.push({ seq: e.seq, slot: e.slot });
+      else if (st.role !== 'player') fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
+      if (!validDate(e.effective_from) || !e.modifiers || typeof e.modifiers !== 'object'
+          || Object.entries(e.modifiers).some(([id,v]) => !registry.has(id) || !isInt(v)))
+        fail(`structure: seq ${e.seq} malformed sheet-update`);
+      M.sheets.push(e);
+    } else if (e.kind === 'check-type') {
+      fail(`structure: seq ${e.seq} check-type changes are not supported`);
+    } else if (e.kind === 'announce') {
+      if (!sessionOpen) fail(`structure: seq ${e.seq} announce outside an open session`);
+      if (e.initiator !== 'gm' && e.initiator !== 'player') fail(`structure: seq ${e.seq} bad initiator`);
+      leak(e);
+      const t = typing(e, slots.get(e.slot));
+      if (t) {
+        sealForms(e, t);
+        if (!t.ritual) fail(`structure: seq ${e.seq} announce for non-ritual check_type ${e.check_type}`);
+      }
+      const cf = transcript?.context_privacy === 'sealed' ? 'context_commit' : 'context';
+      if (!(cf in e)) fail(`structure: seq ${e.seq} announce missing ${cf}`);
+      if ([...openAnns.values()].some(a => !a.resolved)) fail(`structure: seq ${e.seq} announce while another announce is unresolved`);
+      const k = key(e.slot, e.lane), resv = (cursor.get(k) ?? 0) + 1;
+      if (resv > chainLen) fail(`structure: seq ${e.seq} reservation exceeds chain_length`);
+      bump(maxConc, k, resv);
+      openAnns.set(e.seq, {
+        slot: e.slot, lane: e.lane, checkType: e.check_type,
+        initiator: e.initiator, resolved: false,
+      });
+      const commits = {};
+      if (typeof e.context_commit === 'string') commits.context = e.context_commit;
+      if (typeof e.dc_commit === 'string') commits.dc = e.dc_commit;
+      addCarrier(k, { seq: e.seq, pos: resv, commits });
+    } else if (e.kind === 'void') {
+      if (!sessionOpen) fail(`structure: seq ${e.seq} void outside an open session`);
+      if (typeof e.reason !== 'string' || !e.reason.trim()) fail(`structure: seq ${e.seq} malformed void`);
+      const a = openAnns.get(e.announce_seq);
+      if (!a || a.resolved || a.slot !== e.slot || a.lane !== e.lane)
+        fail(`inv 8: seq ${e.seq} announce_seq ${e.announce_seq} does not reference an open announce of ${e.slot}/${e.lane}`);
+      else a.resolved = true;
+      M.voids.set(e.seq, e);
+    } else if (e.kind === 'draw') {
+      if (!sessionOpen) fail(`structure: seq ${e.seq} draw outside an open session`);
+      if (e.initiator !== 'gm' && e.initiator !== 'player') fail(`structure: seq ${e.seq} bad initiator`);
+      leak(e);
+      const t = typing(e, slots.get(e.slot));
+      if (t) {
+        sealForms(e, t);
+        if (t.ritual && !isInt(e.announce_seq)) fail(`structure: seq ${e.seq} ritual draw has no announce_seq`);
+        const mf = t.seal_modifier ? 'mod_commit' : 'modifier';
+        if (!(mf in e)) fail(`structure: seq ${e.seq} draw missing ${mf}`);
+      }
+      if ('announce_seq' in e && !isInt(e.announce_seq)) fail(`structure: seq ${e.seq} bad announce_seq`);
+      if ('batch' in e && (typeof e.batch !== 'string' || !e.batch)) fail(`structure: seq ${e.seq} bad batch`);
+      if ('paired_with' in e && !isInt(e.paired_with)) fail(`structure: seq ${e.seq} bad paired_with`);
+      if (('paired_with' in e) !== ('pair_rule' in e))
+        fail(`structure: seq ${e.seq} paired_with and pair_rule must appear together`);
+      if ('gm_degree' in e && (!isInt(e.gm_degree) || e.gm_degree < 0 || e.gm_degree > 3))
+        fail(`structure: seq ${e.seq} bad gm_degree`);
+      const k = key(e.slot, e.lane), want = (cursor.get(k) ?? 0) + 1;
+      if (!isInt(e.position) || e.position < 1 || e.position > chainLen) fail(`structure: seq ${e.seq} position outside chain_length`);
+      if (e.position !== want) fail(`inv 7: seq ${e.seq} ${e.slot}/${e.lane} position ${e.position}, expected ${want}`);
+      cursor.set(k, e.position);
+      bump(maxConc, k, e.position);
+      (drawsByLane.get(k) ?? drawsByLane.set(k, []).get(k)).push({ seq: e.seq, pos: e.position });
+      drawRecs.set(e.seq, { slot: e.slot, lane: e.lane, position: e.position, session: e.session, batch: e.batch ?? null, hasDc: 'dc' in e || 'dc_commit' in e, checkType: e.check_type, entry: e });
+      if ('announce_seq' in e) {
+        const a = openAnns.get(e.announce_seq);
+        if (!a || a.resolved || a.slot !== e.slot || a.lane !== e.lane
+            || a.checkType !== e.check_type || a.initiator !== e.initiator)
+          fail(`inv 8: seq ${e.seq} announce_seq ${e.announce_seq} does not reference an open announce of ${e.slot}/${e.lane}/${e.check_type}/${e.initiator}`);
+        else a.resolved = true;
+      }
+      if ('batch' in e) {
+        const b = batches.get(e.batch) ?? batches.set(e.batch, { seqs: [], session: e.session, checkType: e.check_type }).get(e.batch);
+        b.seqs.push(e.seq);
+        if (b.session !== e.session || b.checkType !== e.check_type) fail(`inv 13: batch ${e.batch} not contiguous or mixed session/check_type`);
+      }
+      if ('paired_with' in e) {
+        const rk = `${k}#${e.paired_with}`;
+        const partner = (drawsByLane.get(k) ?? []).find(d => d.pos === e.paired_with && d.seq < e.seq);
+        const pr = partner ? drawRecs.get(partner.seq) : null;
+        const grp = pr && (pr.session === e.session || (pr.batch !== null && pr.batch === (e.batch ?? null)));
+        if (!partner || !grp || pairedRefs.has(rk)) fail(`inv 11: seq ${e.seq} invalid paired_with ${e.paired_with}`);
+        else {
+          pairedRefs.add(rk);
+          pairedRefs.add(`${k}#${e.position}`);
+          M.pairs.push({ first: partner.seq, second: e.seq, rule: e.pair_rule });
+        }
+        if (e.pair_rule !== 'fortune' && e.pair_rule !== 'misfortune') fail(`structure: seq ${e.seq} pair_rule ${e.pair_rule}`);
+      }
+      const commits = {};
+      if (typeof e.dc_commit === 'string') commits.dc = e.dc_commit;
+      if (typeof e.mod_commit === 'string') commits.modifier = e.mod_commit;
+      if (typeof e.context_commit === 'string') commits.context = e.context_commit;
+      addCarrier(k, { seq: e.seq, pos: e.position, commits });
+    } else if (e.kind === 'correction') {
+      if (typeof e.reason !== 'string' || !e.reason.trim()) fail(`structure: seq ${e.seq} malformed correction`);
+      if (!drawRecs.has(e.target_seq) || e.target_seq >= e.seq || M.corrections.has(e.target_seq))
+        fail(`inv 14: seq ${e.seq} invalid correction target ${e.target_seq}`);
+      else { M.corrections.add(e.target_seq); if ('replacement_seq' in e) M.replacements.set(e.target_seq, e.replacement_seq); }
+      if ('replacement_seq' in e && (!drawRecs.has(e.replacement_seq)
+          || e.replacement_seq === e.target_seq || e.replacement_seq >= e.seq))
+        fail(`inv 14: seq ${e.seq} invalid correction target ${e.target_seq}`);
+    } else if (e.kind === 'dc-late') {
+      if (!sessionOpen) fail(`structure: seq ${e.seq} dc-late outside an open session`);
+      const t = drawRecs.get(e.target_seq);
+      if (!t || t.session !== e.session || t.hasDc || dcLates.has(e.target_seq))
+        fail(`inv 12: seq ${e.seq} invalid dc-late target ${e.target_seq}`);
+      else {
+        dcLates.add(e.target_seq); M.dcLateOf.set(e.target_seq, e.seq);
+        if (typeof e.dc_commit === 'string') addCarrier(key(t.slot, t.lane), { seq: e.seq, pos: t.position, commits: { dc: e.dc_commit } });
+        else if (isInt(e.dc)) M.opened.set(e.seq, { dc: e.dc });
+        else fail(`structure: seq ${e.seq} dc-late carries neither dc nor dc_commit`);
+      }
+    } else if (e.kind === 'out-of-band') {
+      if (!registry.has(e.check_type)) fail(`inv 10: seq ${e.seq} unknown check_type ${e.check_type}`);
+      if (('slot' in e && (typeof e.slot !== 'string' || !slots.has(e.slot)))
+          || !isInt(e.result) || e.result < 1 || e.result > 20
+          || typeof e.reason !== 'string' || !e.reason)
+        fail(`structure: seq ${e.seq} malformed out-of-band`);
+      for (const f of Object.keys(e)) if (f.endsWith('_commit')) fail(`inv 20: seq ${e.seq} forbidden field ${f}`);
+      M.oob.push(e);
+    } else if (e.kind === 'activation-declare') {
+      const d = e.declaration;
+      const ok = exactKeys(d, ['version','slot','lanes','label_commit','nonce','declared_at','beacon'], `seq ${e.seq} activation declaration`);
+      const bok = d?.beacon && exactKeys(d.beacon, ['chain','round','genesis_time','period'], `seq ${e.seq} activation beacon`);
+      if (!ok || !bok || d.version !== 'wotw-column/1' || d.slot !== deferredQ[activatedCount]
+          || !Array.isArray(d.lanes) || !d.lanes.length || new Set(d.lanes).size !== d.lanes.length
+          || d.lanes.some(l => !LANE_RE.test(String(l))) || typeof d.nonce !== 'string' || !d.nonce
+          || typeof d.label_commit !== 'string' || !HEX64.test(d.label_commit)
+          || typeof d.beacon.chain !== 'string' || !isInt(d.beacon.round) || d.beacon.round < 1
+          || !isInt(d.beacon.genesis_time) || d.beacon.genesis_time < 0
+          || !isInt(d.beacon.period) || d.beacon.period < 1 || !validTs(d.declared_at))
+        fail(`structure: seq ${e.seq} malformed activation declaration`);
+      pendingActivation = { seq: e.seq, declaration: d };
+    } else if (e.kind === 'activate') {
+      if (pendingActivation === null) fail(`structure: seq ${e.seq} activate has no preceding activation-declare`);
+      const rec = e.activation_record;
+      if (typeof rec !== 'object' || rec === null || typeof rec.slot !== 'string') { fail(`structure: seq ${e.seq} malformed activation_record`); continue; }
+      exactKeys(rec, ['version','slot','lanes','label_commit','nonce','declared_at','beacon'], `seq ${e.seq} activation_record`);
+      exactKeys(rec.beacon, ['chain','round','genesis_time','period','randomness'], `seq ${e.seq} activation beacon`);
+      const expected = deferredQ[activatedCount];
+      if (rec.slot !== expected) fail(`inv 16: seq ${e.seq} activation targets ${rec.slot}, expected ${expected}`);
+      activatedCount++;
+      if (pendingActivation !== null) {
+        // canonical() throws on unhashable values (floats, etc.); an
+        // unhashable record can never equal the declaration
+        let declaredMatches = false;
+        try {
+          const { randomness, ...beaconWithout } = rec.beacon ?? {};
+          declaredMatches = canonical({ ...rec, beacon: beaconWithout }) === canonical(pendingActivation.declaration);
+        } catch { declaredMatches = false; }
+        if (!declaredMatches)
+          fail(`inv 17: seq ${e.seq} activation_record differs from declaration at seq ${pendingActivation.seq}`);
+      }
+      const b = rec.beacon;
+      if (!b || !isInt(b.genesis_time) || b.genesis_time < 0 || !isInt(b.period) || b.period < 1)
+        fail(`inv 17: seq ${e.seq} beacon missing genesis_time/period`);
+      else {
+        if (!isInt(b.round) || b.round < 1 || typeof b.chain !== 'string' || typeof b.randomness !== 'string' || !HEX64.test(b.randomness))
+          fail(`inv 17: seq ${e.seq} malformed beacon round/randomness`);
+        const known = KNOWN_CHAINS[b.chain];
+        if (known && (known.genesis_time !== b.genesis_time || known.period !== b.period)) fail(`inv 17: seq ${e.seq} beacon parameters do not match known chain`);
+        const declared = Date.parse(rec.declared_at) / 1000;
+        if (!Number.isFinite(declared)) fail(`structure: seq ${e.seq} bad declared_at`);
+        else {
+          const delta = b.genesis_time + (b.round - 1) * b.period - declared;
+          if (delta < 600) fail(`inv 17: seq ${e.seq} beacon round publishes ${delta}s after declared_at, need >= 600`);
+        }
+      }
+      const st = slots.get(rec.slot);
+      if (st && !st.active) {
+        if (!Array.isArray(rec.lanes) || !rec.lanes.length || new Set(rec.lanes).size !== rec.lanes.length
+            || rec.lanes.some(l => !LANE_RE.test(String(l)))) fail(`structure: seq ${e.seq} malformed activation lanes`);
+        if (Object.keys(e.tails ?? {}).sort().join() !== [...(rec.lanes ?? [])].sort().join())
+          fail(`structure: seq ${e.seq} activation tails do not match declared lanes`);
+        st.active = true; st.lanes = new Set(rec.lanes ?? []);
+        try { st.A = sha256(canonicalBytes(rec)); } catch { fail(`structure: seq ${e.seq} unhashable activation_record`); }
+        actRecords.set(rec.slot, rec);
+        M.activations.push(e);
+        for (const lane of rec.lanes ?? []) {
+          const tl = e.tails?.[lane];
+          if (typeof tl !== 'string' || !HEX64.test(tl)) fail(`structure: seq ${e.seq} missing tail for lane ${lane}`);
+          else tails.set(key(rec.slot, lane), tl);
+        }
+      }
+      pendingActivation = null;
+    } else if (e.kind === 'lane-add') {
+      fail(`structure: seq ${e.seq} lane-add is not supported`);
+    } else if (e.kind === 'retire-slot') {
+      const st = slots.get(e.slot);
+      if (!st || !st.active || st.retired || typeof e.reason !== 'string' || !e.reason.trim())
+        fail(`structure: seq ${e.seq} retire of non-active slot ${e.slot}`);
+      else st.retired = true;
+    } else if (e.kind === 'disclose') {
+      sawDisclose = true;
+      const k = key(e.slot, e.lane), tail = tails.get(k);
+      if (!tail) { fail(`structure: seq ${e.seq} disclose for unknown lane ${k}`); continue; }
+      const t = e.through_position;
+      if (!isInt(t) || t < 1 || t > chainLen) { fail(`structure: seq ${e.seq} bad through_position`); continue; }
+      const w = watermark.get(k) ?? 0;
+      if (t <= w) fail(`inv 22: seq ${e.seq} through_position ${t} must exceed watermark ${w}`);
+      const mc = maxConc.get(k) ?? 0;
+      if (t > mc) fail(`inv 22: seq ${e.seq} through_position ${t} exceeds highest concerned position ${mc}`);
+      // one forward walk serves inv 21, 23, and 24 — O(t), not O(t²)
+      let chainOk = false, walk = null;
+      if (typeof e.preimage === 'string' && HEX64.test(e.preimage)) {
+        walk = [unhex(e.preimage)];
+        for (let i = 1; i <= t; i++) walk.push(chainStep(walk[i - 1]));
+        chainOk = hex(walk[t]) === tail;
+      }
+      if (!chainOk) fail(`inv 21: seq ${e.seq} preimage does not reach tail of ${e.slot}/${e.lane}`);
+      const pAt = pos => walk[t - pos];
+      const opened = Array.isArray(e.opened) ? e.opened : [];
+      if (!Array.isArray(e.opened)) fail(`structure: seq ${e.seq} opened is not an array`);
+      const covered = new Map();
+      for (const c of carriers.get(k) ?? []) if (c.seq < e.seq && c.pos <= t && !openedSeqs.has(c.seq)) covered.set(c.seq, c);
+      let last = -1;
+      for (const el of opened) {
+        if (!el || !isInt(el.seq)) { fail(`structure: seq ${e.seq} malformed opened element`); continue; }
+        if (el.seq <= last) fail(`inv 24: seq ${e.seq} opened not sorted ascending`);
+        last = el.seq;
+        const c = covered.get(el.seq);
+        if (!c) { fail(`inv 24: seq ${e.seq} opened has unexpected seq ${el.seq}`); continue; }
+        covered.delete(el.seq);
+        openedSeqs.add(el.seq);
+        const fields = Object.keys(el).filter(f => f !== 'seq').sort();
+        if (fields.join() !== Object.keys(c.commits).sort().join()) { fail(`inv 24: seq ${e.seq} opened ${el.seq} fields do not match commitments`); continue; }
+        if (chainOk) {
+          const p = pAt(c.pos);
+          for (const f of fields) {
+            let ok = false;
+            try {
+              ok = f === 'dc' ? dcCommitOf(p, c.seq, el.dc) === c.commits.dc
+                : f === 'modifier' ? modCommitOf(p, c.seq, el.modifier) === c.commits.modifier
+                : ctxCommitOf(p, c.seq, el.context) === c.commits.context;
+            } catch { ok = false; }
+            if (!ok) fail(`inv 24: seq ${e.seq} opened ${el.seq} ${f} commitment mismatch`);
+          }
+        }
+        M.opened.set(el.seq, { ...M.opened.get(el.seq), ...Object.fromEntries(fields.map(f => [f, el[f]])) });
+      }
+      for (const s of covered.keys()) fail(`inv 24: seq ${e.seq} opened must include seq ${s}`);
+      if (chainOk) for (const d of drawsByLane.get(k) ?? []) if (d.pos > w && d.pos <= t) rolls[d.seq] = rollFromPreimage(pAt(d.pos));
+      watermark.set(k, Math.max(w, t));
+      discloses.push({ seq: e.seq, slot: e.slot, lane: e.lane, through: t, preimage: e.preimage });
+    } else if (e.kind === 'final-reveal') {
+      if (sessionOpen) fail(`structure: seq ${e.seq} final-reveal while a session is open`);
+      if (finalReveal !== null) fail(`structure: seq ${e.seq} second final-reveal`);
+      else finalReveal = e;
+    } else if (e.kind === 'closed') {
+      if (typeof e.reason !== 'string' || !e.reason.trim()) fail(`structure: seq ${e.seq} malformed closed`);
+      if (closedSeq !== null) fail(`structure: seq ${e.seq} second closed`);
+      closedSeq = e.seq;
+    }
+  }
+
+  // -- end-of-ledger checks --
+  const lastSeq = entries[entries.length-1].seq;
+  for (const [s, a] of openAnns) if (!a.resolved && s !== lastSeq) fail(`inv 9: announce at seq ${s} unresolved`);
+  for (const [id, b] of batches) if (!b.seqs.every((s, i) => i === 0 || s === b.seqs[i-1] + 1)) fail(`inv 13: batch ${id} not contiguous or mixed session/check_type`);
+  if (closedSeq !== null && closedSeq !== lastSeq) fail('inv 26: closed is not the last entry');
+  if (closedSeq !== null && finalReveal === null) fail('inv 26: closed requires final-reveal');
+  if (closedSeq !== null && sessionOpen) fail('inv 26: closed while a session is open');
+
+  // -- inv 25: final reveal — full recomputation from the master secret --
+  if (finalReveal !== null && transcript !== null) {
+    let S = null, secretOk = false;
+    if (typeof finalReveal.secret === 'string' && HEX64.test(finalReveal.secret)) {
+      S = unhex(finalReveal.secret);
+      secretOk = hex(sha256(S)) === transcript.commitment;
+    }
+    if (!secretOk) fail('inv 25: secret does not match commitment');
+    const labels = Array.isArray(finalReveal.labels) ? finalReveal.labels : [];
+    if (!Array.isArray(finalReveal.labels)) fail('inv 25: labels do not cover activations exactly');
+    const lslots = labels.map(l => l?.slot), aslots = [...actRecords.keys()].sort();
+    const sortedOk = lslots.every((s, i) => i === 0 || s > lslots[i-1]);
+    if (!sortedOk || lslots.slice().sort().join() !== aslots.join()) fail('inv 25: labels do not cover activations exactly');
+    if (secretOk) {
+      M.S = S;
+      let E = null;
+      try { E = genesisEntropy(transcript); } catch {}
+      for (const l of labels) {
+        if (!l || typeof l !== 'object' || Object.keys(l).sort().join() !== ['display','role','slot'].sort().join()) {
+          fail(`inv 25: label for ${l?.slot ?? ''} does not recompute`); continue;
+        }
+        const rec = actRecords.get(l?.slot);
+        if (!rec) continue;
+        if (!E) continue; // entropy failure already reported at genesis
+        let ok = false;
+        try {
+          ok = typeof l.display === 'string' && l.display.length > 0
+            && ['player','npc','world'].includes(l.role)
+            && labelCommitOf(labelSalt(S, E, l.slot), l.display, l.role) === rec.label_commit;
+        } catch { ok = false; }
+        if (!ok) fail(`inv 25: label for ${l.slot} does not recompute`);
+        else {
+          M.labels.push(l);
+          const st = slots.get(l.slot);
+          if (st) { st.role = l.role; st.display = l.display; }
+          for (const [seq, d] of drawRecs) {
+            if (d.slot !== l.slot) continue;
+            const t = registry.get(d.checkType);
+            if (t && !t.roles.includes(l.role)) fail(`inv 10: seq ${seq} slot role ${l.role} not in roles of check_type ${d.checkType}`);
+          }
+        }
+      }
+      for (const p of pendingSheetUpdates)
+        if (slots.get(p.slot)?.role !== 'player') fail(`structure: seq ${p.seq} sheet-update for non-player slot ${p.slot}`);
+      let n = 0;
+      for (const [k, tailHex] of tails) {
+        progress?.(`recomputing column ${++n}/${tails.size}…`); await tick();
+        const [slot, lane] = k.split('/');
+        const st = slots.get(slot);
+        if (!E) continue;
+        const ikm = st?.A ? cat(S, E, st.A) : cat(S, E);
+        // walk the chain once: link[i] for i ≤ N−cursor−1 is an unconsumed
+        // position (position N−i); collect its roll for the remainder view
+        const used = cursor.get(k) ?? 0, rem = [];
+        let x = laneRoot(ikm, slot, lane);
+        const links = [x];
+        for (let i = 1; i <= chainLen; i++) { x = chainStep(x); links.push(x); }
+        for (let i = 0; i <= chainLen - used - 1; i++) rem.push(rollFromPreimage(links[i]));
+        rem.reverse(); // now indexed by position: rem[0] is position used+1
+        M.remainder.set(k, rem);
+        if (hex(links[chainLen]) !== tailHex) { fail(`inv 25: tail of ${slot}/${lane} does not recompute`); continue; }
+        for (const d of discloses) {
+          if (d.slot !== slot || d.lane !== lane) continue;
+          if (hex(links[chainLen - d.through]) !== d.preimage) fail(`inv 25: disclosed preimage mismatch for ${slot}/${lane}`);
+        }
+        for (const [seq, d] of drawRecs) if (d.slot === slot && d.lane === lane && isInt(d.position)
+            && d.position >= 1 && d.position <= chainLen) rolls[seq] = rollFromPreimage(links[chainLen - d.position]);
+      }
+      for (const [id, st] of slots) if (!st.active) M.neverActivated.push(id);
+    }
+  }
+
+  // -- assemble model bits the report needs --
+  for (const [k, c] of cursor) M.perLane.set(k, { draws: c, max: maxConc.get(k) ?? c, watermark: watermark.get(k) ?? 0 });
+  for (const [k, mc] of maxConc) if (!M.perLane.has(k)) M.perLane.set(k, { draws: cursor.get(k) ?? 0, max: mc, watermark: watermark.get(k) ?? 0 });
+  M.drawRecs = drawRecs; M.registry = registry; M.finalReveal = finalReveal;
+  res.state = finalReveal !== null ? 'fully revealed' : sawDisclose ? 'partially disclosed' : 'sealed';
+  res.verdict = F.length ? 'FAILED' : 'VERIFIED';
+  return res;
+}
+
+// ====================== statistics (§8.5) ===================================
+const phi = z => 0.5 * (1 + Math.tanh(z * (0.7978845608 + 0.0356774 * z * z))); // erf approx, |err|<3e-4
+function chiSquare(rollsArr) { // vs uniform(1,20); p via Wilson–Hilferty
+  const n = rollsArr.length, exp = n / 20, counts = new Array(21).fill(0);
+  for (const r of rollsArr) counts[r]++;
+  let x2 = 0;
+  for (let f = 1; f <= 20; f++) x2 += (counts[f] - exp) ** 2 / exp;
+  const kdf = 19, z = ((x2 / kdf) ** (1/3) - (1 - 2/(9*kdf))) / Math.sqrt(2/(9*kdf));
+  return { x2, p: 1 - phi(z), counts };
+}
+function runsTest(rollsArr) { // runs above/below the 10.5 median
+  const seq = rollsArr.map(r => r > 10.5);
+  const n1 = seq.filter(Boolean).length, n2 = seq.length - n1;
+  if (n1 === 0 || n2 === 0) return null;
+  let runs = 1;
+  for (let i = 1; i < seq.length; i++) if (seq[i] !== seq[i-1]) runs++;
+  const mu = 2*n1*n2/(n1+n2) + 1;
+  const sd = Math.sqrt(2*n1*n2*(2*n1*n2-n1-n2) / ((n1+n2)**2 * (n1+n2-1)));
+  const z = (runs - mu) / sd;
+  return { runs, mu, p: 2 * (1 - phi(Math.abs(z))) };
+}
+function longestStreak(rollsArr) {
+  let best = 1, cur = 1;
+  for (let i = 1; i < rollsArr.length; i++) { cur = rollsArr[i] === rollsArr[i-1] ? cur + 1 : 1; best = Math.max(best, cur); }
+  return best;
+}
+
+// ============================ UI ============================================
+const INV_LABELS = ['seq gapless', 'unique genesis', 'prev chain', 'hash recomputes', 'ts monotonic',
+  'commitment hex', 'positions gapless', 'announce refs', 'no dangling announce', 'registry typing',
+  'paired draws', 'dc-late rules', 'batch atomicity', 'correction rules', 'no post-retire draws',
+  'ordered allocation', 'beacon declaration/wait', 'no pre-activation draws', 'routing frozen', 'no leaked values',
+  'preimage reaches tail', 'watermark monotonic', 'values derived', 'openings exact', 'final reveal recomputes', 'closed is last'];
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) k === 'class' ? el.className = v : el.setAttribute(k, v);
+  for (const kid of kids.flat(9)) if (kid != null) el.append(kid.nodeType ? kid : String(kid));
+  return el;
+}
+const short = s => typeof s === 'string' ? s.slice(0, 12) + '…' : String(s);
+function bars(counts, mark) { // counts[1..20] histogram with 10.5 marker
+  const mx = Math.max(1, ...counts.slice(1));
+  const wrap = h('div', { class: 'bars' });
+  for (let f = 1; f <= 20; f++) {
+    const bar = h('div', { title: `${f}: ${counts[f]}` }, h('span', {}, f % 5 === 0 || f === 1 ? f : ''));
+    bar.style.height = (counts[f] / mx * 100) + '%';
+    if (mark && f === 10) bar.style.borderRight = '2px solid #c62828';
+    wrap.append(bar);
+  }
+  return wrap;
+}
+
+function render(res) {
+  const M = res.model, V = document.getElementById('verdict'), R = document.getElementById('report');
+  V.textContent = ''; R.textContent = '';
+  const label = res.incomplete ? 'INCOMPLETE' : res.verdict === 'VERIFIED' ? `VERIFIED (${res.state})` : 'FAILED';
+  V.append(h('div', { class: 'verdict ' + (res.incomplete ? 'inc' : res.verdict === 'VERIFIED' ? 'ok' : 'bad') }, label));
+  if (res.verdict === 'VERIFIED' && res.state !== 'fully revealed')
+    V.append(h('p', {}, 'Sealed structure and custody verified. Values not yet openable — this is the normal mid-campaign state, not a deficiency: every sealed position is already an irrevocable commitment (see below).'));
+
+  // invariant checklist
+  const failedInv = new Set();
+  for (const f of res.failures) { const m = f.match(/^inv (\d+)/); if (m) failedInv.add(+m[1]); }
+  const grid = h('div', { class: 'invgrid' });
+  INV_LABELS.forEach((lbl, i) => grid.append(h('div', { class: failedInv.has(i+1) ? 'bad' : 'ok' }, `${failedInv.has(i+1) ? '✗' : '✓'} ${i+1}. ${lbl}`)));
+  V.append(h('h2', {}, 'Invariants (§3.3)'), grid);
+  if (res.failures.length) V.append(h('h3', { class: 'bad' }, `${res.failures.length} failure(s)`), ...res.failures.map(f => h('div', { class: 'failmsg' }, f)));
+  if (res.incomplete) return;
+
+  // overview
+  const days = M.lastTs ? Math.floor((Date.now() - Date.parse(M.lastTs)) / 86400000) : null;
+  const dayCls = days > 30 ? 'bad' : days > 10 ? 'warn' : 'ok';
+  R.append(h('h2', {}, 'Overview'), h('table', {}, [
+    ['Entries', res.entries], ['Head', h('code', {}, short(document.__ledgerHead ?? ''))],
+    ['Last ledger entry', `${M.lastTs ?? '—'} `, h('span', { class: dayCls }, days === null ? '' : `(${days} days ago)`)],
+    ['Corrections', M.corrections.size], ['Out-of-band rolls', M.oob.length],
+    ['reveal-all uses', h('span', { class: M.revealAlls.length ? 'warn' : 'ok' }, M.revealAlls.length)],
+    ['Activations', M.activations.length], ['Stated policy', M.transcript?.disclosure_policy ?? '—'],
+  ].map(([k, ...v]) => h('tr', {}, h('th', {}, k), h('td', {}, ...v)))));
+  if (M.activations.length) {
+    R.append(h('p', { class: 'warn' },
+      'Beacon authenticity is not checked here. Compare every activation’s chain, round, and randomness with an official drand explorer; this verifier checks only the witnessed declaration, timing, and exact value binding.'));
+    const beacons = h('table', {},
+      h('thead', {}, h('tr', {}, ['seq', 'slot', 'chain', 'round', 'randomness'].map(x => h('th', {}, x)))));
+    for (const e of M.activations) {
+      const rec = e.activation_record, b = rec.beacon;
+      beacons.append(h('tr', {},
+        h('td', {}, e.seq),
+        h('td', {}, h('code', {}, rec.slot)),
+        h('td', {}, h('code', {}, b.chain)),
+        h('td', {}, b.round),
+        h('td', {}, h('code', {}, b.randomness))));
+    }
+    R.append(h('h3', {}, 'Activation beacons — manual authenticity check required'), beacons);
+  }
+
+  const lanes = h('table', {}, h('thead', {}, h('tr', {}, ['slot/lane', 'draws', 'voids', 'disclosed through', 'lag (draws)'].map(x => h('th', {}, x)))));
+  const voidsByLane = new Map();
+  for (const v of M.voids.values()) { const k = `${v.slot}/${v.lane}`; voidsByLane.set(k, (voidsByLane.get(k) ?? 0) + 1); }
+  for (const [k, s] of [...M.perLane].sort()) lanes.append(h('tr', {}, h('td', {}, h('code', {}, k)), h('td', {}, s.draws), h('td', {}, voidsByLane.get(k) ?? 0), h('td', {}, s.watermark || '—'), h('td', {}, s.max - s.watermark)));
+  R.append(h('h3', {}, 'Per-lane custody'), lanes);
+
+  // registry
+  const reg = h('table', {}, h('thead', {}, h('tr', {}, ['id', 'lane', 'roles', 'seal DC', 'seal mod', 'ritual', ''].map(x => h('th', {}, x)))));
+  const amended = new Map(M.regEvents.map(e => [e.check_type.id, e]));
+  for (const [id, t] of M.registry ?? []) reg.append(h('tr', {}, h('td', {}, h('code', {}, id)), h('td', {}, t.lane), h('td', {}, (t.roles ?? []).join(' ')),
+    h('td', {}, t.seal_dc ? '✓' : '—'), h('td', {}, t.seal_modifier ? '✓' : '—'), h('td', {}, t.ritual ? '✓' : '—'),
+    h('td', { class: 'warn' }, amended.has(id) ? `${amended.get(id).op} at seq ${amended.get(id).seq}` : '')));
+  R.append(h('h2', {}, 'Check-type registry'), reg);
+
+  // per-slot history (§8.2)
+  R.append(h('h2', {}, 'Draw history'));
+  const bySlot = new Map();
+  for (const [seq, d] of M.drawRecs ?? []) (bySlot.get(d.slot) ?? bySlot.set(d.slot, []).get(d.slot)).push(d);
+  for (const [slot, ds] of [...bySlot].sort()) {
+    const st = M.slots.get(slot);
+    const name = st?.display ? `${st.display} (${slot}${st.role ? ', ' + st.role : ''})` : slot;
+    const det = h('details', { open: '' }, h('summary', {}, `${name} — ${ds.length} draws`));
+    const tb = h('table', {}, h('thead', {}, h('tr', {}, ['date', 's.', 'lane', '#', 'check type', 'init', 'mod', 'result', ''].map(x => h('th', {}, x)))));
+    const disclosed = [];
+    for (const d of ds) {
+      const e = d.entry, seq = e.seq, roll = res.rolls[seq];
+      const openedVals = M.opened.get(seq) ?? {};
+      const lateSeq = M.dcLateOf.get(seq);
+      const dc = e.dc ?? openedVals.dc ?? (lateSeq !== undefined ? M.opened.get(lateSeq)?.dc : undefined);
+      const mod = e.modifier ?? openedVals.modifier;
+      const ctx = e.context ?? openedVals.context;
+      let resultCell, note = '';
+      if (roll === undefined) resultCell = h('span', { class: 'sealed' }, 'sealed');
+      else if (dc !== undefined && mod !== undefined) {
+        resultCell = `${roll} ${mod >= 0 ? '+' + mod : mod} = ${roll + mod} vs DC ${dc} → ${DEGREES[degreeOf(roll, mod, dc)]} ✓`;
+        disclosed.push(roll);
+      } else { resultCell = `${roll}${mod !== undefined ? ` (${mod >= 0 ? '+' + mod : mod})` : ''} — no DC`; disclosed.push(roll); }
+      if (M.corrections.has(seq)) note = ` drawn in error${M.replacements.has(seq) ? ` → redrawn at seq ${M.replacements.get(seq)}` : ''}`;
+      const pair = M.pairs.find(p => p.first === seq || p.second === seq);
+      if (pair) note += ` ${pair.rule} pair (${pair.first}↔${pair.second})`;
+      tb.append(h('tr', { class: M.corrections.has(seq) ? 'corrected' : '' },
+        h('td', {}, e.ts.slice(0, 10)), h('td', {}, e.session), h('td', {}, e.lane), h('td', {}, e.position),
+        h('td', { title: ctx ?? '' }, e.check_type + (ctx ? ' †' : '')), h('td', {}, e.initiator),
+        h('td', {}, mod ?? h('span', { class: 'sealed' }, 'sealed')), h('td', {}, resultCell), h('td', { class: 'warn' }, note)));
+    }
+    det.append(tb);
+    if (disclosed.length) {
+      const mean = disclosed.reduce((a, b) => a + b, 0) / disclosed.length;
+      det.append(h('p', { class: 'mut' }, `${disclosed.length} disclosed · mean ${mean.toFixed(2)} (uniform expects 10.50) · undisclosed: ${ds.length - disclosed.length}`), bars(chiSquare(disclosed).counts, true));
+    } else det.append(h('p', { class: 'sealed' }, 'no values disclosed yet'));
+    R.append(det);
+  }
+
+  // modifier cross-check (§8.4)
+  R.append(h('h2', {}, 'Modifier cross-check'), h('p', { class: 'mut' }, 'Published modifiers vs sheet-update history. Disagreements are advisory — check against your actual sheet.'));
+  const mc = h('table', {}, h('thead', {}, h('tr', {}, ['slot', 'check type', 'date', 'draw mod', 'sheet mod', ''].map(x => h('th', {}, x)))));
+  for (const [seq, d] of M.drawRecs ?? []) {
+    const e = d.entry;
+    if (typeof e.modifier !== 'number') continue;
+    const date = e.ts.slice(0, 10);
+    const sheet = M.sheets.filter(s => s.slot === d.slot && s.effective_from <= date).pop();
+    const sv = sheet?.modifiers?.[d.checkType];
+    const ok = sv === undefined || sv === e.modifier;
+    mc.append(h('tr', {}, h('td', {}, d.slot), h('td', {}, d.checkType), h('td', {}, date), h('td', {}, e.modifier),
+      h('td', {}, sv ?? '—'), h('td', { class: ok ? 'ok' : 'warn' }, ok ? '✓' : 'differs (advisory)')));
+  }
+  R.append(mc);
+
+  // post-reveal audit (§8.5)
+  if (res.state === 'fully revealed' && M.S) {
+    R.append(h('h2', {}, 'Post-reveal audit'),
+      h('p', {}, 'Master secret opened: ', h('code', {}, hex(M.S)), ' — every root, chain, and tail recomputed from it; all published tails and previously disclosed preimages matched (invariant 25).'));
+    if (M.labels.length) R.append(h('h3', {}, 'Opened labels'), h('table', {}, M.labels.map(l => h('tr', {}, h('td', {}, h('code', {}, l.slot)), h('td', {}, l.display), h('td', {}, l.role)))));
+    const stat = h('table', {}, h('thead', {}, h('tr', {}, ['slot', 'n', 'χ² (df 19)', 'p', 'runs', 'p', 'longest streak', ''].map(x => h('th', {}, x)))));
+    for (const [slot, ds] of [...bySlot].sort()) {
+      const rs = ds.map(d => res.rolls[d.entry.seq]).filter(r => r !== undefined);
+      if (rs.length < 5) continue;
+      const cs = chiSquare(rs), rt = runsTest(rs), streak = longestStreak(rs);
+      const verdictTxt = cs.p < 0.001 || (rt && rt.p < 0.001) ? 'anomalous — investigate' : 'consistent with fair dice';
+      stat.append(h('tr', {}, h('td', {}, slot), h('td', {}, rs.length), h('td', {}, cs.x2.toFixed(1)), h('td', {}, cs.p.toFixed(3)),
+        h('td', {}, rt ? rt.runs : '—'), h('td', {}, rt ? rt.p.toFixed(3) : '—'), h('td', {}, streak), h('td', { class: 'mut' }, verdictTxt)));
+    }
+    R.append(h('h3', {}, 'Statistical tests (disclosed draws)'), stat,
+      h('p', { class: 'mut' }, 'p is the probability of a deviation at least this large from fair d20s. Small p (< 0.001) is suspicious; p near 1 is not "extra fair", just unremarkable.'));
+    const remainderObject = Object.fromEntries([...M.remainder].sort());
+    const download = h('button', {}, 'Download complete remainder JSON');
+    download.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(remainderObject, null, 2) + '\n'], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = h('a', { href: url, download: 'column-unconsumed-remainder.json' });
+      document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    });
+    R.append(h('h3', {}, 'The unconsumed remainder'),
+      h('p', { class: 'mut' }, 'Every created sequence continues past its last draw. These values were committed but never consumed. A 20-value preview is shown; the download contains every value of every remainder.'),
+      download);
+    for (const [k, rem] of [...M.remainder].sort()) {
+      R.append(h('p', {}, h('code', {}, k), ` — ${rem.length} unconsumed: `, h('span', { class: 'mono' }, rem.slice(0, 20).join(' ') + (rem.length > 20 ? ' …' : ''))));
+    }
+    if (M.neverActivated.length) R.append(h('p', { class: 'mut' }, `Slots never activated: ${M.neverActivated.join(', ')}. Their columns were never fixed — activation mixes in a randomness-beacon round that never happened, so there is nothing to open. The reservation itself (ordered, committed at genesis) is what they contributed.`));
+  }
+}
+
+// ============================ boot ==========================================
+async function selfTest() {
+  if (hex(sha256(new Uint8Array(0))) !== 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') throw Error('sync SHA-256 self-test failed');
+  const okm = hkdf(new Uint8Array(22).fill(0x0b), unhex('000102030405060708090a0b0c'), unhex('f0f1f2f3f4f5f6f7f8f9'), 42);
+  if (hex(okm) !== '3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865') throw Error('HKDF self-test failed');
+  if (globalThis.crypto?.subtle) { // cross-check the two SHA-256s (§8.6)
+    const ref = new Uint8Array(await crypto.subtle.digest('SHA-256', utf8('column')));
+    if (hex(ref) !== hex(sha256(utf8('column')))) throw Error('WebCrypto cross-check failed');
+  }
+}
+globalThis.__column = { verifyLedger, canonical, sha256: b => hex(sha256(b)), rollFromPreimage, degreeOf, selfTest, chiSquare, runsTest, render: (...a) => render(...a) };
+
+if (globalThis.document) {
+  const status = m => { document.getElementById('status').textContent = m; };
+  async function run(text) {
+    let data;
+    try { data = JSON.parse(text); } catch (err) {
+      document.getElementById('verdict').innerHTML = '';
+      document.getElementById('verdict').append(h('div', { class: 'verdict inc' }, 'INCOMPLETE'), h('p', { class: 'bad' }, 'Not valid JSON: ' + err.message));
+      return;
+    }
+    document.__ledgerHead = data?.head;
+    status('verifying…');
+    const t0 = performance.now();
+    const res = await verifyLedger(data, status);
+    status(`verified ${res.entries} entries in ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+    render(res);
+  }
+  (async () => {
+    try { await selfTest(); } catch (err) { status(String(err)); return; }
+    document.getElementById('filepick').addEventListener('change', ev => {
+      const f = ev.target.files[0];
+      if (f) f.text().then(run);
+    });
+    document.getElementById('pastebtn').addEventListener('click', () => run(document.getElementById('paste').value));
+    const url = new URLSearchParams(location.search).get('ledger');
+    if (url) {
+      status('fetching ledger…');
+      try { run(await (await fetch(url)).text()); } catch (err) { status('fetch failed: ' + err.message); }
+    }
+  })();
+}
+</script>
+</body></html>
