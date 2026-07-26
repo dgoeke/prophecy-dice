@@ -43,7 +43,7 @@ export function Disclose() {
       <div className="pane">
         <h2>Standing policy</h2>
         <p className="dim">{policy || '—'}</p>
-        <p className="faint">The app records the policy and shows the lag; it does not enforce a cadence. Pick watermarks far enough back that knowing the roll cannot change how the table reads a live scene (§4.4).</p>
+        <p className="faint">The app records the policy and shows the lag; it does not enforce a cadence. Pick watermarks far enough back that knowing the roll cannot change how the table reads a live scene.</p>
       </div>
       {msg && <p className="open-c">{msg}</p>}
       <div className="pane">

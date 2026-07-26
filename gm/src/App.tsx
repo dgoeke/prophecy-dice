@@ -55,7 +55,7 @@ export function App() {
 
   return (
     <>
-      {status.rehearsal && <div className="banner rehearsal">REHEARSAL — throwaway secret, publishes to an isolated directory by default, refuses mirrors, discard freely (§7.8)</div>}
+      {status.rehearsal && <div className="banner rehearsal">REHEARSAL — throwaway secret, publishes to an isolated directory by default, refuses mirrors, discard freely</div>}
       <header className="statusbar">
         <span className="wordmark">PROPHECY DICE</span>
         <nav className="nav">

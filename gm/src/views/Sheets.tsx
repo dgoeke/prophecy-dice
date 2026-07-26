@@ -32,7 +32,7 @@ export function Sheets() {
   return (
     <div>
       {msg && <p className="open-c">{msg}</p>}
-      <p className="dim">Auto-filled modifiers are what keep a routine draw at one keystroke — and they archive a year of level-ups better than anyone's memory (§7.5).</p>
+      <p className="dim">Auto-filled modifiers are what keep a routine draw at one keystroke — and they archive a year of level-ups better than anyone's memory.</p>
       {table.slots.filter((s) => s.active && !s.retired).map((slot) => {
         const isPublic = slot.role === 'player';
         const types = table.registry.filter((t) => t.roles.includes(slot.role ?? '') && slot.lanes.includes(t.lane));

@@ -82,7 +82,7 @@ export function Slots({ status }: { status: Status }) {
       ) : (
         <div className="pane">
           <h2>Activate {table.next_deferred ?? '— no deferred slots left'}</h2>
-          <p className="dim">Only the lowest deferred slot is offered (§2.9). The label seals until final reveal; a joining player should type their own nonce.</p>
+          <p className="dim">Only the lowest deferred slot is offered. The label seals until final reveal; a joining player should type their own nonce.</p>
           {table.next_deferred && (
             <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
               <label className="fld">display (sealed)<input type="text" value={form.display} onChange={(e) => setForm((f) => ({ ...f, display: e.target.value }))} /></label>
@@ -109,7 +109,7 @@ export function Slots({ status }: { status: Status }) {
               }), 'declared — wait for the beacon round')}>Declare</button>
             </div>
           )}
-          <p className="faint" style={{ marginTop: '.6rem' }}>Activate during prep, in small batches — not the moment a scene needs it. For a genuinely unplanned roll, use the world's routine lane (§4.5).</p>
+          <p className="faint" style={{ marginTop: '.6rem' }}>Activate during prep, in small batches — not the moment a scene needs it. For a genuinely unplanned roll, use the world's routine lane.</p>
         </div>
       )}
     </div>

@@ -594,7 +594,7 @@ function CorrectSheet({ log, table, push, say, refresh, close }: any) {
     <div className="overlay" onKeyDown={(e) => { if (e.key === 'Escape') close(); }}>
       <div className="dialog">
         <h2>Correct the last draw</h2>
-        <p className="dim">seq {last.seq} · {last.who} · {last.desc}. The position is consumed and stays consumed — this marks it misattributed, publicly (§5.8).</p>
+        <p className="dim">seq {last.seq} · {last.who} · {last.desc}. The position is consumed and stays consumed — this marks it misattributed, publicly.</p>
         <div className="row"><label className="fld">reason (public)<input type="text" autoFocus value={reason} onChange={(e) => setReason(e.target.value)} /></label></div>
         <div className="row">
           <span className="dim">redraw correctly on:</span>
@@ -663,7 +663,7 @@ function CloseSession({ status, close, say, refresh }: any) {
         <h2>Close session {status.session} &amp; publish</h2>
         {stage === 'review' && (
           <>
-            <p className="dim">Draws still missing a DC — seal them now or leave them DC-less forever (§7.3.7):</p>
+            <p className="dim">Draws still missing a DC — seal them now or leave them DC-less forever:</p>
             {dcless === null ? <p className="faint">checking…</p> : dcless.length === 0
               ? <p className="open-c">Every draw this session has its DC.</p>
               : dcless.map((e) => (
@@ -682,7 +682,7 @@ function CloseSession({ status, close, say, refresh }: any) {
         )}
         {stage === 'done' && (
           <>
-            <p className="open-c">Published. Post this digest to the group chat — it is the external anchor (§7.7):</p>
+            <p className="open-c">Published. Post this digest to the group chat — it is the external anchor:</p>
             <textarea readOnly rows={4} value={digest ?? ''} onFocus={(e) => e.target.select()} />
             <footer>
               <button className="btn" onClick={() => { navigator.clipboard?.writeText(digest ?? ''); say('digest copied'); }}>Copy</button>

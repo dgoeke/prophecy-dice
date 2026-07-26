@@ -33,7 +33,7 @@ in
         description = ''
           Address to bind. On a shared server this MUST be the Tailscale
           interface IP (or 127.0.0.1 behind `tailscale serve`) — never a
-          public interface and never 0.0.0.0 (§6.6).
+          public interface and never 0.0.0.0.
         '';
       };
       port = mkOption { type = types.port; default = 7777; };
@@ -45,7 +45,7 @@ in
       publicDir = mkOption {
         type = types.path;
         default = "/var/lib/column/public";
-        description = "Published artifacts only — written by explicit publish (§4.3).";
+        description = "Published artifacts only — written by explicit publish.";
       };
       drandEndpoint = mkOption { type = types.str; default = "https://api.drand.sh"; };
       gitMirrorCommand = mkOption {
@@ -55,7 +55,7 @@ in
         description = ''
           Run in publicDir after each publish. A remote commit history is an
           independent witness only if players can see it and the GM cannot
-          quietly rewrite it (§6.6). Command success is reported, but the
+          quietly rewrite it. Command success is reported, but the
           application cannot prove that the command actually pushed. Failure
           never blocks the local publish.
         '';
@@ -65,7 +65,7 @@ in
           type = types.bool;
           default = false;
           description = ''
-            WARNING (§6.4): auto-unlocking from an on-disk secret makes disk
+            WARNING: auto-unlocking from an on-disk secret makes disk
             compromise total — anyone with the disk has every sealed value of
             the campaign. Manual unlock is one action per boot on a machine
             that reboots monthly. Leave this off unless you have weighed that.
@@ -85,7 +85,7 @@ in
     };
 
     backup = {
-      enable = mkEnableOption "automated off-box backups of state/ (§6.7)";
+      enable = mkEnableOption "automated off-box backups of state/";
       onCalendar = mkOption { type = types.str; default = "daily"; };
       command = mkOption {
         type = types.str;
@@ -119,7 +119,7 @@ in
       ];
 
       systemd.services.column-gm = {
-        description = "Prophecy Dice — GM service (boots locked, §6.4)";
+        description = "Prophecy Dice — GM service (boots locked)";
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
@@ -186,7 +186,7 @@ in
 
     (mkIf cfg.backup.enable {
       systemd.services.column-backup = {
-        description = "Prophecy Dice — off-box state backup (§6.7)";
+        description = "Prophecy Dice — off-box state backup";
         script = cfg.backup.command;
         serviceConfig = { Type = "oneshot"; User = "column"; Group = "column"; };
       };

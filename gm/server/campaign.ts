@@ -183,7 +183,7 @@ export class Campaign {
       if (stateIsRehearsal !== !!this.opts.rehearsal) {
         this.lock(); // clears key and priv
         err(stateIsRehearsal
-          ? 'this state was created in rehearsal mode and cannot be promoted to a real campaign (§7.8)'
+          ? 'this state was created in rehearsal mode and cannot be promoted to a real campaign'
           : 'this is real campaign state; refusing to open it in rehearsal mode', 409);
       }
       this.locked = false;
@@ -221,7 +221,7 @@ export class Campaign {
     if (this.phase !== 'precommitted') err('genesis requires a precommitted, ledger-less campaign', 409);
     const age = this.now() - Date.parse(this.priv!.precommit_at);
     const minAge = this.opts.minPrecommitAgeMs ?? 3_600_000;
-    if (age < minAge) err(`pre-commit is ${Math.floor(age / 1000)}s old; must be at least ${Math.floor(minAge / 1000)}s (§4.1)`, 409);
+    if (age < minAge) err(`pre-commit is ${Math.floor(age / 1000)}s old; must be at least ${Math.floor(minAge / 1000)}s`, 409);
     const total = input.reserve_total ?? 64;
     if (!Number.isInteger(total) || total < 1 || total > 999) err('reserve_total must be an integer from 1 to 999');
     if (!Number.isInteger(input.chain_length ?? 20000) || (input.chain_length ?? 20000) < 1
@@ -257,7 +257,7 @@ export class Campaign {
     for (const s of input.active_slots) {
       if (typeof s.display !== 'string' || !s.display.trim()) err('every active slot needs a display name');
       if (!['player', 'npc', 'world'].includes(s.role)) err('role must be player|npc|world');
-      if (typeof s.nonce !== 'string' || !s.nonce) err('every active slot needs a nonce, entered at the table (§4.2)');
+      if (typeof s.nonce !== 'string' || !s.nonce) err('every active slot needs a nonce, entered at the table');
       if (!Array.isArray(s.lanes) || s.lanes.length === 0 || new Set(s.lanes).size !== s.lanes.length) {
         err(`slot ${s.display} needs a non-empty list of distinct lanes`);
       }
@@ -453,7 +453,7 @@ export class Campaign {
         err('announce_seq does not match the exact open announce');
       }
       this.openAnnounce = null;
-    } else if (this.openAnnounce) err('an announce is unresolved: reveal or void it first (§7.3.4)');
+    } else if (this.openAnnounce) err('an announce is unresolved: reveal or void it first');
     if (type.ritual && req.announce_seq === undefined) {
       err(`check_type ${req.check_type} is ritual and must be announced before it is drawn`);
     }
@@ -461,7 +461,7 @@ export class Campaign {
     const links = this.links.get(key) ?? err(`no chain for ${key}`);
     const N = this.transcript.chain_length;
     const position = (this.cursor.get(key) ?? 0) + 1;
-    if (position > N) err(`lane ${key} is exhausted (N=${N}); no extension protocol exists (§10.2)`, 409);
+    if (position > N) err(`lane ${key} is exhausted (N=${N}); no extension protocol exists`, 409);
     if (position > N * 0.8) console.warn(`[column] warning: ${key} at ${position}/${N} (>80%)`);
     const p = C.preimageAt(links, position);
     const seq = this.entries.length;
@@ -612,7 +612,7 @@ export class Campaign {
       if (!this.sessionOpen_) err('dc-late requires an open session');
       const t = this.entries[req.target_seq];
       if (!t || t.kind !== 'draw') err('dc-late target must be a draw');
-      if (t.session !== this.session) err('dc-late must land in the same session as its draw (§3.2)');
+      if (t.session !== this.session) err('dc-late must land in the same session as its draw');
       if ('dc' in t || 'dc_commit' in t) err('target already has a DC');
       if (this.entries.some((e) => e.kind === 'dc-late' && e.target_seq === req.target_seq)) err('target already has a dc-late');
       if (!Number.isInteger(req.dc)) err('dc must be an integer');
@@ -730,9 +730,9 @@ export class Campaign {
       const expected = this.deferredQueue[this.activatedCount] ?? err('no deferred slots left', 409);
       // ordered allocation is structural: the server only ever offers the
       // lowest deferred slot (§2.9, §7.4)
-      if (req.slot !== undefined && req.slot !== expected) err(`activation must target ${expected}, the lowest deferred slot (§2.9)`);
+      if (req.slot !== undefined && req.slot !== expected) err(`activation must target ${expected}, the lowest deferred slot`);
       if (typeof req.display !== 'string' || !req.display.trim()) err('display is required');
-      if (typeof req.nonce !== 'string' || !req.nonce) err('nonce is required for every activation (§2.8)');
+      if (typeof req.nonce !== 'string' || !req.nonce) err('nonce is required for every activation');
       if (!Array.isArray(req.lanes) || req.lanes.length === 0 || new Set(req.lanes).size !== req.lanes.length) {
         err('activation requires a non-empty list of distinct lanes');
       }
@@ -780,7 +780,7 @@ export class Campaign {
     const pend = this.priv?.pending ?? err('no pending activation', 409);
     const beacon = this.opts.beacon ?? err('no beacon provider', 500);
     if (this.now() / 1000 < roundTime(pend.beacon)) {
-      err(`beacon round ${pend.beacon.round} publishes at ${roundTime(pend.beacon)}; wait (§4.5)`, 409);
+      err(`beacon round ${pend.beacon.round} publishes at ${roundTime(pend.beacon)}; wait`, 409);
     }
     const randomness = await beacon.fetch(pend.beacon.round);
     if (!/^[0-9a-f]{64}$/.test(randomness)) err('beacon returned malformed randomness', 502);
@@ -939,7 +939,7 @@ export class Campaign {
       // audience, so its presence is a hard configuration error here rather
       // than something the GM must remember not to trigger.
       if (this.opts.rehearsal && this.opts.mirrorCommand) {
-        err('rehearsal must not be configured with a git mirror: it would publish a throwaway campaign to the players (§7.8)', 409);
+        err('rehearsal must not be configured with a git mirror: it would publish a throwaway campaign to the players', 409);
       }
       const from = this.priv!.last_published_seq + 1;
       const fresh = this.entries.slice(from);
@@ -1032,7 +1032,7 @@ export class Campaign {
   /** §7.9 paced walkthrough data. Post-reveal only (criterion 9). */
   walkthrough() {
     this.requireLive();
-    if (!this.finalRevealed) err('final reveal has not happened (§7.9)', 409);
+    if (!this.finalRevealed) err('final reveal has not happened', 409);
     const N = this.transcript.chain_length;
     const out: any[] = [];
     for (const [id, st] of [...this.slots.entries()].sort()) {
@@ -1205,7 +1205,7 @@ export class Campaign {
     const file = JSON.parse(text);
     const res = verifyLedger(file);
     if (res.verdict !== 'VERIFIED') {
-      throw new Error(`ledger failed verification on load; refusing to start (§6.3):\n${res.failures.join('\n')}`);
+      throw new Error(`ledger failed verification on load; refusing to start:\n${res.failures.join('\n')}`);
     }
     this.entries = file.entries;
     const nEntries = this.entries.length;

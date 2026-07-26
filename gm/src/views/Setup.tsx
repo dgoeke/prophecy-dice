@@ -167,7 +167,7 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
         {step === 0 && (
           <section className="pane">
             <h2>Pre-commit — the night before session zero</h2>
-            <p className="dim">A 32-byte secret is generated and sealed under your passphrase. Its hash — the commitment — goes to the group chat <em>now</em>, before any player contributes entropy. The later column roots combine that already-committed secret with the players’ nonces (§2.4).</p>
+            <p className="dim">A 32-byte secret is generated and sealed under your passphrase. Its hash — the commitment — goes to the group chat <em>now</em>, before any player contributes entropy. The later column roots combine that already-committed secret with the players’ nonces.</p>
             {!commitment ? (
               <>
                 <div className="row" style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
@@ -175,13 +175,13 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
                   <label className="fld">again<input type="password" value={pass2} onChange={(e) => setPass2(e.target.value)} /></label>
                 </div>
                 <p><button className="btn primary" onClick={doPrecommit}>Generate S and commit</button></p>
-                <p className="faint">Losing this passphrase after session zero permanently destroys the audit (§6.7). Put it in a password manager tonight.</p>
+                <p className="faint">Losing this passphrase after session zero permanently destroys the audit. Put it in a password manager tonight.</p>
               </>
             ) : (
               <>
                 <p>Commitment <code>C</code> — post this to the group chat with a timestamp:</p>
                 <div className="commitment">{commitment.commitment}</div>
-                <p className="dim">committed at {commitment.precommit_at} · the ceremony may begin one hour later (§4.1)</p>
+                <p className="dim">committed at {commitment.precommit_at} · the ceremony may begin one hour later</p>
                 <p>
                   <button className="btn" onClick={() => navigator.clipboard?.writeText(commitment.commitment)}>Copy C</button>{' '}
                   <button className="btn primary" onClick={() => setStep(1)}>Continue to the table →</button>
@@ -218,7 +218,7 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
         {step === 2 && (
           <section className="pane">
             <h2>Check-type registry — committed at genesis</h2>
-            <p className="dim">Which lane each kind of check consumes is fixed here, forever — lane choice can never be a per-roll decision (§2.5). The registry cannot be amended after genesis because changing routing after seeing columns would be a grinding surface.</p>
+            <p className="dim">Which lane each kind of check consumes is fixed here, forever — lane choice can never be a per-roll decision. The registry cannot be amended after genesis because changing routing after seeing columns would be a grinding surface.</p>
             <table className="grid"><thead><tr><th>id</th><th>label</th><th>lane</th><th>roles</th><th>seal DC</th><th>seal mod</th><th>ritual</th><th /></tr></thead><tbody>
               {registry.map((r, i) => {
                 const up = (patch: any) => setRegistry((rs) => rs.map((x, j) => j === i ? { ...x, ...patch } : x));

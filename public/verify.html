@@ -928,7 +928,7 @@ function render(res) {
   for (const f of res.failures) { const m = f.match(/^inv (\d+)/); if (m) failedInv.add(+m[1]); }
   const grid = h('div', { class: 'invgrid' });
   INV_LABELS.forEach((lbl, i) => grid.append(h('div', { class: failedInv.has(i+1) ? 'bad' : 'ok' }, `${failedInv.has(i+1) ? '✗' : '✓'} ${i+1}. ${lbl}`)));
-  V.append(h('h2', {}, 'Invariants (§3.3)'), grid);
+  V.append(h('h2', {}, 'Invariants'), grid);
   if (res.failures.length) V.append(h('h3', { class: 'bad' }, `${res.failures.length} failure(s)`), ...res.failures.map(f => h('div', { class: 'failmsg' }, f)));
   if (res.incomplete) return;
 
