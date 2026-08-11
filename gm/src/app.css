@@ -89,6 +89,11 @@ table.grid { border-collapse: collapse; width: 100%; font-size: .84rem; }
   background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--r);
   text-align: left; align-items: stretch; width: 100%;
 }
+.slotarm {
+  display: flex; gap: .6rem; flex: 1; min-width: 0; padding: 0;
+  border: 0; background: transparent; color: inherit; font: inherit; text-align: inherit;
+  align-items: stretch; cursor: pointer;
+}
 .slotcard:hover { border-color: var(--brass-dim); }
 .slotcard.armed { border-color: var(--brass); background: var(--paper-3); }
 .slotcard .body { flex: 1; min-width: 0; }

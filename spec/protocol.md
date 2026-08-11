@@ -62,7 +62,7 @@ The GM's machine computes the columns. **The GM can read every future value at a
 
 - **Omission is undetectable.** Reading ahead, seeing an unfavourable value, and declining to call for that check produces a consistent ledger. Non-invocation consumes nothing and logs nothing.
 - **Scheduling is undetectable.** Seeing high values queued and arranging a pivotal scene leaves no trace.
-- **Under-reporting is not cryptographically detectable.** Nothing forces the GM to log a draw. What constrains it is prompt publication plus human memory — and **at this volume, memory is weak.** Four people will remember whether a climactic declared check happened; they will not remember whether session 14 held nine or eleven routine secret checks. The count guarantee is strong for ritual draws and weak for routine ones. The UI must say so rather than presenting one number for both.
+- **Under-reporting is not cryptographically detectable.** Nothing forces the GM to log a draw. What constrains it is prompt publication plus human memory — and **at this volume, memory is weak.** Five people will remember whether a climactic declared check happened; they will not remember whether session 14 held nine or eleven routine secret checks. The count guarantee is strong for ritual draws and weak for routine ones. The UI must say so rather than presenting one number for both.
 - **Statistical audit is the compensating control.** Thousands of disclosed draws per player give chi-square and runs tests real power that ritual-only volume would not.
 - `reveal-all` (§7.3.9), announce-before-draw (§7.3.4), and ordered allocation are **speed bumps and social ritual** except where explicitly verifier-enforced.
 - **External witnessing is required.** A hash chain prevents changing history only relative to a head players already saved. Until a commitment or head is copied to player-controlled chat or a mirror, the GM can replace the whole unpublished artifact.
@@ -192,8 +192,9 @@ Fixed at the end of session zero:
     { "id": "slot-02", "display": "Player Two", "role": "player", "status": "active", "lanes": ["sealed","open"], "nonce": "9f2c81..." },
     { "id": "slot-03", "display": "Carol", "role": "player", "status": "active", "lanes": ["sealed","open"], "nonce": "..." },
     { "id": "slot-04", "display": "Dave",  "role": "player", "status": "active", "lanes": ["sealed","open"], "nonce": "..." },
-    { "id": "slot-05", "display": "the world", "role": "world", "status": "active", "lanes": ["open","routine","deep"], "nonce": "..." },
-    { "id": "slot-06", "display": null, "role": null, "status": "deferred", "lanes": null, "nonce": null },
+    { "id": "slot-05", "display": "Eve",   "role": "player", "status": "active", "lanes": ["sealed","open"], "nonce": "..." },
+    { "id": "slot-06", "display": "the world", "role": "world", "status": "active", "lanes": ["open","routine","deep"], "nonce": "..." },
+    { "id": "slot-07", "display": null, "role": null, "status": "deferred", "lanes": null, "nonce": null },
     …
     { "id": "slot-64", "display": null, "role": null, "status": "deferred", "lanes": null, "nonce": null }
   ],
@@ -205,7 +206,7 @@ Rules:
 
 - `slots` ordered by `id` ascending, `slot-NN` zero-padded, contiguous from `slot-01`.
 - `status` ∈ `active` (fully specified now) | `deferred` (reserved; role, lanes, display, and nonce all supplied at activation).
-- **Reserve generously. Default: 64 slots**, 5 active. Slots cost a few kilobytes of transcript and milliseconds of derivation; exhaustion is a real operational failure and reservation is nearly free.
+- **Reserve generously. Default: 64 slots**, 6 active: five players plus the world. Slots cost a few kilobytes of transcript and milliseconds of derivation; exhaustion is a real operational failure and reservation is nearly free.
 - `context_privacy` ∈ `plain` | `sealed`. Default `plain`.
 - `disclosure_policy` is free text with no machine meaning; it commits the GM's stated cadence.
 - `chain_length` (N): **default 20000** (§5.7).
@@ -294,7 +295,7 @@ One protocol for every later addition — a joining player, a newly-significant 
 ```json
 {
   "version": "wotw-column/1",
-  "slot": "slot-06",
+  "slot": "slot-07",
   "lanes": ["sealed", "open"],
   "label_commit": "<hex 64>",
   "nonce": "supplied string",
@@ -509,7 +510,7 @@ GM generates `S`; app computes `C`; GM publishes `C` to the group chat with a ti
 ### 4.2 Phase 1 — Ceremony (at the table, session zero)
 
 1. GM displays the published `C`; players confirm against the earlier chat message.
-2. GM sets `N`, exact slot order and roster (default 64 slots, 5 active: four players plus the world), lane sets, `context_privacy`, `disclosure_policy`, and the complete **check-type registry**.
+2. GM sets `N`, exact slot order and roster (default 64 slots, 6 active: five players plus the world), lane sets, `context_privacy`, `disclosure_policy`, and the complete **check-type registry**.
 3. App validates those choices, computes `configuration_commitment`, displays the exact committed projection, and the players post that commitment to chat.
 4. Only now does each player enter their own nonce. At least one player
    generates an unpredictable value on a player-controlled device after seeing
@@ -602,7 +603,7 @@ The `correction` entry solves it: **the value stays burned.** It was consumed, t
 
 | | GM app | Player verifier |
 |---|---|---|
-| Audience | one person, holds the secret | four skeptics |
+| Audience | one person, holds the secret | five skeptics |
 | Complexity budget | normal | **severe** |
 | Dependencies | may use a framework | **zero** |
 | Form | server-hosted web app, private network | single self-contained HTML file |
@@ -720,7 +721,7 @@ server refuses to proceed if the pre-commit is under one hour old.
 
 **This screen is a correctness requirement.** At 25–50 draws per session, every avoidable interaction is a reason the GM abandons the system. Design target: **a routine draw costs one keystroke and zero typing.**
 
-1. **Three sections**, because their selection axes differ: **Players** (four stable cards, digits 1–4, modifiers auto-filled from sheets, batch draw lives here); **NPCs** (a roster growing to dozens of which two or three matter per scene — needs a **scene bench**: pin the NPCs in play, only pinned ones get hotkeys 5–8, persisted in private state); **World** (one slot, several lanes — no person to select, so the card picks lane-plus-purpose, keys 9 and 0).
+1. **Three sections**, because their selection axes differ: **Players** (five stable cards, digits 1–5, modifiers auto-filled from sheets, batch draw lives here); **NPCs** (a roster growing to dozens of which two or three matter per scene — needs a **scene bench**: pin the NPCs in play, only pinned ones get hotkeys 6–8, persisted in private state); **World** (one slot, several lanes — no person to select, so the card picks lane-plus-purpose, keys 9 and 0).
 2. **Keyboard-first.** Digit selects a slot or lane; a letter selects a check type, scoped automatically to the selected slot's role; `Enter` draws. Dedicated keys handle batch, DC, veil, correction, session, and publication actions. Mouse-only must work but is not the design target.
 3. Cards show positions consumed and remaining per lane, plus current disclosure lag.
 4. **Ritual draws** (`ritual: true`): select → context sheet with picker and initiator toggle → **Announce** → large "ANNOUNCED" state offering only **Reveal** and **Void** → Reveal writes the draw, stores link and result privately, displays one very large numeral. **Voids are visually loud.**
@@ -729,7 +730,7 @@ server refuses to proceed if the pre-commit is under one hour old.
 7. **Deferred DC**: any draw may be made without a DC and given one later in the same session; a session-end review list shows every DC-less draw for a quick pass. Never force DC entry mid-scene.
 8. **Misfire**: an undo affordance on the last draw writes a `correction` (§5.8), states plainly that the position stays consumed, and offers to immediately re-draw correctly and link the two.
 9. **Peek (`reveal-all`)**: behind a confirmation stating *"This writes a public `reveal-all` entry your players will see"*, writing the entry **before** displaying anything; if the write fails, show nothing. It is desirable for this to feel bad to use.
-10. **Privacy key.** Results display on a machine four people may see. One keystroke blanks **all results and all NPC names** — the roster may include characters the players have not met yet, and a glance at one name can spoil an introduction. The NPC section defaults collapsed.
+10. **Privacy key.** Results display on a machine five people may see. One keystroke blanks **all results and all NPC names** — the roster may include characters the players have not met yet, and a glance at one name can spoil an introduction. The NPC section defaults collapsed.
 11. **Publish**: exports, writes the open-lane disclosure, copies `head`, generates the digest (§7.7), and optionally runs the configured git mirror push.
 
 ### 7.4 `/slots` — roster and activation
@@ -762,7 +763,7 @@ Posting it gives the timestamps an externally-witnessed anchor and makes "felt l
 
 ### 7.8 Rehearsal mode
 
-Session zero happens once, in front of four people, on software that has never been run in anger. Rehearsal mode writes to its own state directory against a throwaway secret, has an unmistakable persistent banner, and is **structurally unable to be promoted to the real ceremony** (the flag rides inside the authenticated ciphertext, so the files cannot be reopened as a real campaign).
+Session zero happens once, in front of five people, on software that has never been run in anger. Rehearsal mode writes to its own state directory against a throwaway secret, has an unmistakable persistent banner, and is **structurally unable to be promoted to the real ceremony** (the flag rides inside the authenticated ciphertext, so the files cannot be reopened as a real campaign).
 
 It **publishes into its own separate directory by default**, because the session-close wizard publishes and the player verifier reads a published artifact: a rehearsal that cannot publish cannot rehearse either of them, which is most of what a dress run is for. The development defaults isolate both state and publication from a real run, while explicitly configured directories are used exactly as supplied. A configured git mirror makes publishing a hard error, and the digest labels itself as a rehearsal, since the chat digest is the one artifact that travels without its context.
 

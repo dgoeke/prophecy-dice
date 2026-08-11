@@ -2,7 +2,7 @@
  * /table — in-session play (§7.3). This screen is a correctness requirement:
  * a routine draw is one keystroke with zero typing (acceptance criterion 4).
  *
- * Keyboard model: digits 1–4 arm players, 5–8 the NPC bench, 9/0 the world
+ * Keyboard model: digits 1–5 arm players, 6–8 the NPC bench, 9/0 the world
  * (routine / deep purpose); a lowercase letter arms a check type scoped to
  * the armed slot's role; Enter draws. Arming is sticky, so repeating the
  * same check is Enter alone. `b` arms a party-wide batch, `d` edits the DC,
@@ -17,6 +17,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, CheckType, DEGREES, laneColor, SlotInfo, Status, TableState, uuid } from '../api';
 
 const RESERVED_KEYS = new Set(['b', 'd', 'm']);
+// Ten digit keys: the world always owns 9/0, so the remaining keys split
+// between the five keyboard-addressable players and the NPC scene bench.
+const PLAYER_KEY_COUNT = 5;
+const WORLD_KEY_COUNT = 2;
+const NPC_BENCH_CAPACITY = 10 - PLAYER_KEY_COUNT - WORLD_KEY_COUNT;
+const FIRST_NPC_KEY = PLAYER_KEY_COUNT + 1;
+const LAST_NPC_KEY = FIRST_NPC_KEY + NPC_BENCH_CAPACITY - 1;
+const HOTKEY_LEGEND = `press 1–${PLAYER_KEY_COUNT}, ${FIRST_NPC_KEY}–${LAST_NPC_KEY}, 9/0`;
 
 interface LogLine {
   id: number; t: string; seq?: number; who: string; lane?: string; position?: number;
@@ -42,6 +50,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
   const [dc, setDc] = useState<number | null>(null);
   const [dcEditing, setDcEditing] = useState(false);
   const [modEditing, setModEditing] = useState(false);
+  const [pinSaving, setPinSaving] = useState(false);
   // the last announcement seq the server was observed to be holding open
   const seenAnnounce = useRef<number | null>(null);
   const [overlay, setOverlay] = useState<Overlay | null>(null);
@@ -86,10 +95,15 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
     });
   }, [table, overlay, typeById]);
   const slots = table?.slots ?? [];
-  const players = useMemo(() => slots.filter((s) => s.active && !s.retired && s.role === 'player').slice(0, 4), [slots]);
+  const players = useMemo(() => slots.filter((s) => s.active && !s.retired && s.role === 'player'), [slots]);
   const world = useMemo(() => slots.find((s) => s.active && !s.retired && s.role === 'world') ?? null, [slots]);
   const npcs = useMemo(() => slots.filter((s) => s.active && !s.retired && s.role === 'npc'), [slots]);
-  const bench = useMemo(() => (table?.ui_state?.bench ?? []).filter((id) => npcs.some((n) => n.id === id)).slice(0, 4), [table, npcs]);
+  // Preserve every stored pin, including legacy four-NPC benches. Only the
+  // first three have digit keys; no UI interaction silently discards another.
+  const pinnedBench = useMemo(() => [...new Set(table?.ui_state?.bench ?? [])]
+    .filter((id) => npcs.some((n) => n.id === id)), [table, npcs]);
+  const bench = useMemo(() => pinnedBench.slice(0, NPC_BENCH_CAPACITY), [pinnedBench]);
+  const overflowPlayers = players.slice(PLAYER_KEY_COUNT);
 
   const armedSlot = slots.find((s) => s.id === armed.slot) ?? null;
 
@@ -111,14 +125,16 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
   const say = (m: string) => { setFlash(m); setTimeout(() => setFlash(null), 2600); };
 
   const armDigit = useCallback((key: string) => {
+    const digit = Number(key);
     const worldType = (lane: string) =>
       registry.find((t) => t.roles.includes('world') && t.lane === lane && world?.lanes.includes(t.lane))
       ?? registry.find((t) => t.roles.includes('world') && world?.lanes.includes(t.lane));
-    if (key >= '1' && key <= '4') {
-      const p = players[Number(key) - 1];
+    if (digit >= 1 && digit <= PLAYER_KEY_COUNT) {
+      const p = players[digit - 1];
       if (p) setArmed((a) => ({ slot: p.id, type: a.type && typeById[a.type]?.roles.includes('player') ? a.type : null, batch: false }));
-    } else if (key >= '5' && key <= '8') {
-      const n = npcs.find((x) => x.id === bench[Number(key) - 5]);
+      else say('no player assigned to that key');
+    } else if (digit >= FIRST_NPC_KEY && digit <= LAST_NPC_KEY) {
+      const n = npcs.find((x) => x.id === bench[digit - FIRST_NPC_KEY]);
       if (n) setArmed((a) => ({ slot: n.id, type: a.type && typeById[a.type]?.roles.includes('npc') ? a.type : null, batch: false }));
       else say('no NPC pinned on that key — pin from the bench');
     } else if (key === '9' && world) {
@@ -260,27 +276,35 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           </div>
           <div className="slotgrid players">
             {players.map((p, i) => (
-              <SlotCard key={p.id} slot={p} digit={String(i + 1)} lanes={table.lanes}
+              <SlotCard key={p.id} slot={p} digit={i < PLAYER_KEY_COUNT ? String(i + 1) : '·'} lanes={table.lanes}
                 armed={armed.slot === p.id} veilName={false} veiled={veiled}
-                onArm={() => armDigit(String(i + 1))} />
+                onArm={() => setArmed((a) => ({ slot: p.id, type: a.type && typeById[a.type]?.roles.includes('player') ? a.type : null, batch: false }))} />
             ))}
           </div>
+          {overflowPlayers.length > 0 && <p className="rubric">{overflowPlayers.map((p) => p.display ?? p.id).join(', ')} {overflowPlayers.length === 1 ? 'has' : 'have'} no numeric hotkey, but {overflowPlayers.length === 1 ? 'is' : 'are'} included in party-wide batches.</p>}
 
           <details className="npcs">
-            <summary className="sectionhead"><span className="eyebrow">NPCs — bench {bench.length}/{npcs.length}</span></summary>
+            <summary className="sectionhead"><span className="eyebrow">NPCs — {pinnedBench.length} pinned; {bench.length}/{NPC_BENCH_CAPACITY} hotkeys</span></summary>
             <div className="slotgrid" style={{ marginTop: '.4rem' }}>
               {npcs.map((n) => {
-                const pin = bench.indexOf(n.id);
+                const pin = pinnedBench.indexOf(n.id);
                 return (
-                  <SlotCard key={n.id} slot={n} digit={pin >= 0 ? String(5 + pin) : '·'} lanes={table.lanes}
+                  <SlotCard key={n.id} slot={n} digit={pin >= 0 && pin < NPC_BENCH_CAPACITY ? String(FIRST_NPC_KEY + pin) : '·'} lanes={table.lanes}
                     armed={armed.slot === n.id} veilName veiled={veiled}
                     onArm={() => setArmed({ slot: n.id, type: null, batch: false })}
                     extra={
                       <button className="btn ghost" onClick={(e) => {
                         e.stopPropagation();
-                        const next = pin >= 0 ? bench.filter((b) => b !== n.id) : [...bench, n.id].slice(0, 4);
-                        api('/api/ui-state', { ...(table.ui_state ?? {}), bench: next }).then(refreshTable);
-                      }}>{pin >= 0 ? 'unpin' : 'pin'}</button>
+                        const next = pin >= 0 ? pinnedBench.filter((b) => b !== n.id) : [...pinnedBench, n.id];
+                        if (pin < 0 && pinnedBench.length >= NPC_BENCH_CAPACITY) {
+                          say('NPC pinned without a numeric hotkey; existing hotkeys remain unchanged');
+                        }
+                        setPinSaving(true);
+                        api('/api/ui-state', { ...(table.ui_state ?? {}), bench: next })
+                          .then(refreshTable)
+                          .catch((e) => say(e.message))
+                          .finally(() => setPinSaving(false));
+                      }} disabled={pinSaving}>{pin >= 0 ? 'unpin' : 'pin'}</button>
                     } />
                 );
               })}
@@ -324,7 +348,9 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       </div>
 
       <div className="armedbar">
-        <span className="who">{armedSlot ? (armedSlot.display ?? armedSlot.id) : <span className="faint">press 1–4, 5–8, 9/0</span>}{armed.batch && <span className="brass"> ×{players.length} batch</span>}</span>
+        <span className="who">{armedSlot
+          ? <span className={armedSlot.role === 'npc' ? 'veilable' + (veiled ? ' veiled' : '') : ''}>{armedSlot.display ?? armedSlot.id}</span>
+          : <span className="faint">{HOTKEY_LEGEND}</span>}{armed.batch && <span className="brass"> ×{players.length} batch</span>}</span>
         {scopedTypes.map((t) => (
           <button key={t.id} className={'typechip' + (armed.type === t.id ? ' armed' : '')}
             onClick={() => setArmed((a) => ({ ...a, type: t.id }))}>
@@ -382,8 +408,9 @@ function SlotCard({ slot, digit, lanes, armed, onArm, veiled, veilName, note, ex
   onArm: () => void; veiled: boolean; veilName: boolean; note?: string; extra?: any;
 }) {
   return (
-    <button className={'slotcard' + (armed ? ' armed' : '')} onClick={onArm}>
-      <span className="colonnade">
+    <div className={'slotcard' + (armed ? ' armed' : '')}>
+      <button className="slotarm" onClick={onArm}>
+        <span className="colonnade">
         {slot.lanes.map((lane) => {
           const st = lanes[`${slot.id}/${lane}`] ?? { drawn: 0, remaining: 1, watermark: 0 };
           const total = st.drawn + st.remaining;
@@ -396,8 +423,8 @@ function SlotCard({ slot, digit, lanes, armed, onArm, veiled, veilName, note, ex
             </span>
           );
         })}
-      </span>
-      <span className="body">
+        </span>
+        <span className="body">
         <span className="name">
           <span className={veilName ? 'veilable' + (veiled ? ' veiled' : '') : ''}>{slot.display ?? slot.id}</span>
           <span className="eyebrow">{slot.role}</span>
@@ -408,10 +435,11 @@ function SlotCard({ slot, digit, lanes, armed, onArm, veiled, veilName, note, ex
           ))}
           {note && <span className="faint">{note}</span>}
         </span>
-      </span>
+        </span>
+        <span className="keycap">{digit}</span>
+      </button>
       {extra}
-      <span className="keycap">{digit}</span>
-    </button>
+    </div>
   );
 }
 

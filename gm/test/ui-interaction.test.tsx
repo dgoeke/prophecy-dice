@@ -35,16 +35,24 @@ beforeAll(async () => {
   await campaign.precommit(PASS);
   const genesisInput = {
     campaign: 'UI Test', chain_length: 200, context_privacy: 'plain' as const,
-    disclosure_policy: 'test', reserve_total: 6,
+    disclosure_policy: 'test', reserve_total: 10,
     check_types: [
       { id: 'rk-general', label: 'Recall Knowledge — general', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
       { id: 'perception-secret', label: 'Secret Perception', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
       { id: 'rk-cosmology', label: 'RK — cosmology', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
+      { id: 'npc-open', label: 'NPC — open', lane: 'open', roles: ['npc'], seal_dc: false, seal_modifier: true, ritual: false },
       { id: 'world-routine', label: 'World — routine', lane: 'routine', roles: ['world'], seal_dc: true, seal_modifier: true, ritual: false },
     ],
     active_slots: [
       { display: 'Alice', role: 'player', lanes: ['sealed', 'open'], nonce: 'a' },
       { display: 'Bob', role: 'player', lanes: ['sealed', 'open'], nonce: 'b' },
+      { display: 'Cara', role: 'player', lanes: ['sealed', 'open'], nonce: 'c' },
+      { display: 'Dan', role: 'player', lanes: ['sealed', 'open'], nonce: 'd' },
+      { display: 'Eve', role: 'player', lanes: ['sealed', 'open'], nonce: 'e' },
+      { display: 'Fenn', role: 'npc', lanes: ['open'], nonce: 'f' },
+      { display: 'Gale', role: 'npc', lanes: ['open'], nonce: 'g' },
+      { display: 'Hale', role: 'npc', lanes: ['open'], nonce: 'h' },
+      { display: 'Iris', role: 'npc', lanes: ['open'], nonce: 'i' },
       { display: 'the world', role: 'world', lanes: ['open', 'routine'], nonce: 'w' },
     ],
   };
@@ -58,11 +66,18 @@ beforeAll(async () => {
     slot: 'slot-02', effective_from: '2026-08-14',
     modifiers: { 'rk-general': 6, 'perception-secret': 5, 'rk-cosmology': 3 },
   });
+  for (const [slot, modifier] of [['slot-03', 4], ['slot-04', 3], ['slot-05', 2]] as const) {
+    await campaign.sheetUpdate({
+      slot, effective_from: '2026-08-14',
+      modifiers: { 'rk-general': modifier, 'perception-secret': modifier, 'rk-cosmology': modifier },
+    });
+  }
   await campaign.sessionOpen();
   server = createServer(campaign);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   (globalThis as any).__API_BASE = `http://127.0.0.1:${(server.address() as any).port}`;
   await api('/api/unlock', { passphrase: PASS });
+  await api('/api/ui-state', { bench: ['slot-06', 'slot-07', 'slot-08'] });
 });
 
 afterAll(() => {
@@ -76,6 +91,23 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     render(<App />);
     // the table view loads with the roster
     await screen.findByText('Alice');
+
+    // A fourth pin must not reshuffle or discard the three keyboard-assigned
+    // NPCs; it remains visible as pinned without a numeric hotkey.
+    fireEvent.click(screen.getByText(/NPCs —/));
+    fireEvent.click(screen.getByRole('button', { name: 'pin' }));
+    await waitFor(() => expect((campaign.tableState().ui_state as { bench?: string[] } | null)?.bench)
+      .toEqual(['slot-06', 'slot-07', 'slot-08', 'slot-09']));
+    expect(screen.getByText(/NPCs — 4 pinned; 3\/3 hotkeys/)).toBeTruthy();
+
+    // The full keyboard map is a usability invariant: five players, three
+    // pinned NPCs, and the world's two lanes occupy all ten digit keys.
+    for (const [key, name] of [['1', 'Alice'], ['2', 'Bob'], ['3', 'Cara'], ['4', 'Dan'], ['5', 'Eve'], ['6', 'Fenn'], ['7', 'Gale'], ['8', 'Hale'], ['9', 'the world'], ['0', 'the world']]) {
+      fireEvent.keyDown(window, { key });
+      await waitFor(() => expect(document.querySelector('.armedbar .who')?.textContent).toContain(name));
+    }
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.querySelector('.armedbar .who')?.textContent).toContain('press 1–5, 6–8, 9/0');
 
     // ---- arm once: digit selects the slot, a letter selects the check type
     fireEvent.keyDown(window, { key: '1' });
@@ -99,9 +131,9 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     // ---- party-wide batch: exactly two interactions ('b', Enter)
     fireEvent.keyDown(window, { key: 'b' });
     fireEvent.keyDown(window, { key: 'Enter' });
-    await waitFor(() => expect(draws()).toHaveLength(4));
+    await waitFor(() => expect(draws()).toHaveLength(7));
     const batch = draws().slice(2);
-    expect(batch.map((e: any) => e.slot).sort()).toEqual(['slot-01', 'slot-02']);
+    expect(batch.map((e: any) => e.slot).sort()).toEqual(['slot-01', 'slot-02', 'slot-03', 'slot-04', 'slot-05']);
     expect(new Set(batch.map((e: any) => e.batch)).size).toBe(1); // atomic, shared id
     expect(document.activeElement).toBe(document.body);
 
@@ -111,10 +143,14 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
   }, 20_000);
 
   it('the privacy key veils results and NPC names instantly (§7.3.10)', async () => {
+    fireEvent.keyDown(window, { key: '6' });
+    await waitFor(() => expect(document.querySelector('.armedbar .who .veilable')?.textContent).toBe('Fenn'));
     fireEvent.keyDown(window, { key: '.' });
     await waitFor(() => expect(document.querySelectorAll('.log .roll.veiled').length).toBeGreaterThan(0));
+    expect(document.querySelector('.armedbar .who .veilable')?.classList).toContain('veiled');
     fireEvent.keyDown(window, { key: '.' });
     await waitFor(() => expect(document.querySelectorAll('.log .roll.veiled')).toHaveLength(0));
+    expect(document.querySelector('.armedbar .who .veilable')?.classList).not.toContain('veiled');
   });
 
   it('ritual types open announce-then-reveal instead of drawing (§7.3.4)', async () => {
@@ -165,7 +201,7 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     // and now the draw the GM originally wanted just works, one keystroke
     fireEvent.keyDown(window, { key: 'Enter' });
     await waitFor(() => expect(draws()).toHaveLength(before + 1));
-    expect(draws().at(-1).slot).toBe('slot-03');
+    expect(draws().at(-1).slot).toBe('slot-10');
     // world-routine seals its modifier, so the value is committed not published
     expect(draws().at(-1).mod_commit).toMatch(/^[0-9a-f]{64}$/);
   }, 20_000);

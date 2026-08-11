@@ -23,6 +23,8 @@ const SUGGESTED_REGISTRY = [
 ];
 
 const STEPS = ['pre-commit', 'roster & lanes', 'registry', 'parameters', 'player entropy', 'review', 'genesis'];
+const DEFAULT_PLAYER_COUNT = 5;
+const blankPlayer = () => ({ display: '', nonce: '', lanes: 'sealed,open' });
 
 const randHex = () => {
   const b = new Uint8Array(16);
@@ -40,12 +42,7 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
   const [commitment, setCommitment] = useState<{ commitment: string; precommit_at: string } | null>(
     () => status.precommit ?? JSON.parse(localStorage.getItem('column-precommit') ?? 'null'),
   );
-  const [players, setPlayers] = useState([
-    { display: '', nonce: '', lanes: 'sealed,open' },
-    { display: '', nonce: '', lanes: 'sealed,open' },
-    { display: '', nonce: '', lanes: 'sealed,open' },
-    { display: '', nonce: '', lanes: 'sealed,open' },
-  ]);
+  const [players, setPlayers] = useState(() => Array.from({ length: DEFAULT_PLAYER_COUNT }, blankPlayer));
   const [withWorld, setWithWorld] = useState(true);
   const [worldNonce, setWorldNonce] = useState('');
   const [registry, setRegistry] = useState(SUGGESTED_REGISTRY.map((r) => ({ ...r, roles: r.roles.join(',') })));
@@ -199,18 +196,21 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
               <div className="commitment">{commitment.commitment}</div>
             </>}
             <p className="dim" style={{ marginTop: '.8rem' }}>Set the exact player-to-slot order and lane names now. Nobody enters a nonce yet: roster mapping, lanes, check routing, and chain length can all select different committed values, so players will witness those choices first.</p>
-            <table className="grid"><thead><tr><th>player / slot order</th><th>lanes</th></tr></thead><tbody>
+            <table className="grid"><thead><tr><th>player / slot order</th><th>lanes</th><th /></tr></thead><tbody>
               {players.map((p, i) => (
                 <tr key={i}>
                   <td><input type="text" placeholder={`player ${i + 1}`} value={p.display} onChange={(e) => setPlayers((ps) => ps.map((x, j) => j === i ? { ...x, display: e.target.value } : x))} /></td>
                   <td><input type="text" value={p.lanes} style={{ width: '9rem' }} onChange={(e) => setPlayers((ps) => ps.map((x, j) => j === i ? { ...x, lanes: e.target.value } : x))} /></td>
+                  <td><button className="btn ghost" aria-label={`remove player ${i + 1}`} disabled={players.length === 1} onClick={() => setPlayers((ps) => ps.filter((_, j) => j !== i))}>×</button></td>
                 </tr>
               ))}
               <tr>
                 <td><label><input type="checkbox" checked={withWorld} onChange={(e) => setWithWorld(e.target.checked)} /> the world</label></td>
                 <td><span className="mono faint">open,routine,deep</span></td>
+                <td />
               </tr>
             </tbody></table>
+            <p><button className="btn" onClick={() => setPlayers((ps) => [...ps, blankPlayer()])}>+ add player</button></p>
             <footer className="wz"><button className="btn ghost" onClick={() => setStep(0)}>← back</button><button className="btn primary" onClick={() => setStep(2)}>registry →</button></footer>
           </section>
         )}
