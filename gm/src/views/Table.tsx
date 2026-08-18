@@ -8,12 +8,13 @@
  * same check is Enter alone. `b` arms a party-wide batch, `d` edits the DC,
  * `m` is reserved for the pending manual/profile picker added in session 2;
  * `.` veils results and NPC names, `U` corrects the last draw, `O`/`C` open
- * and close the session, and `P` publishes.
+ * and close the session, and `P` publishes. `m` enters a one-off manual
+ * modifier and `,` cycles the armed check through the slot's profiles.
  *
  * Sealed results live only in this component's memory: after a refresh they
  * are gone, and recovering them requires the logged reveal-all (criterion 9).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, CheckType, DEGREES, laneColor, SlotInfo, Status, TableState, uuid } from '../api';
 
 const RESERVED_KEYS = new Set(['b', 'd', 'm']);
@@ -26,6 +27,16 @@ const FIRST_NPC_KEY = PLAYER_KEY_COUNT + 1;
 const LAST_NPC_KEY = FIRST_NPC_KEY + NPC_BENCH_CAPACITY - 1;
 const HOTKEY_LEGEND = `press 1–${PLAYER_KEY_COUNT}, ${FIRST_NPC_KEY}–${LAST_NPC_KEY}, 9/0`;
 
+export function assignTypeHotkeys(types: CheckType[]): (CheckType & { key: string })[] {
+  const used = new Set(RESERVED_KEYS);
+  return types.map((type) => {
+    let key = '';
+    for (const ch of type.id) if (/[a-z]/.test(ch) && !used.has(ch)) { key = ch; break; }
+    if (key) used.add(key);
+    return { ...type, key };
+  });
+}
+
 interface LogLine {
   id: number; t: string; seq?: number; who: string; lane?: string; position?: number;
   desc: string; roll?: number; mod?: number; dcVal?: number; kind: 'draw' | 'void' | 'note';
@@ -34,19 +45,27 @@ interface LogLine {
 
 type Overlay =
   | { mode: 'context'; slot: string; typeId: string; }
-  | { mode: 'announced'; slot: string; typeId: string; announceSeq: number; context: string; dcVal: number | null; initiator: 'gm' | 'player' }
+  | { mode: 'announced'; slot: string; typeId: string; announceSeq: number; context: string; dcVal: number | null; initiator: 'gm' | 'player'; recovered: boolean }
   | { mode: 'numeral'; roll: number; mod?: number; dcVal?: number; label: string }
   | { mode: 'void'; slot: string; announceSeq: number }
   | { mode: 'correct' }
   | { mode: 'closing' }
   | { mode: 'publish' };
 
+export type PendingModifier =
+  | { kind: 'profile'; name: string; value: number }
+  | { kind: 'manual'; value: number };
+
+interface Armed { slot: string | null; type: string | null; batch: boolean }
+
 let logId = 0;
 const nowT = () => new Date().toTimeString().slice(0, 5);
 
 export function Table({ status, onChange }: { status: Status & { session_open?: boolean }; onChange: () => void }) {
   const [table, setTable] = useState<TableState | null>(null);
-  const [armed, setArmed] = useState<{ slot: string | null; type: string | null; batch: boolean }>({ slot: null, type: null, batch: false });
+  const [armed, setArmed] = useState<Armed>({ slot: null, type: null, batch: false });
+  const [pendingModifier, setPendingModifier] = useState<PendingModifier | null>(null);
+  const [manualEditing, setManualEditing] = useState(false);
   const [dc, setDc] = useState<number | null>(null);
   const [dcEditing, setDcEditing] = useState(false);
   const [pinSaving, setPinSaving] = useState(false);
@@ -58,6 +77,10 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
   const [flash, setFlash] = useState<string | null>(null);
 
   const refreshTable = useCallback(async () => setTable(await api<TableState>('/api/table')), []);
+  const say = useCallback((m: string) => {
+    setFlash(m);
+    setTimeout(() => setFlash(null), 2600);
+  }, []);
   useEffect(() => { refreshTable(); }, [refreshTable]);
 
   const registry = table?.registry ?? [];
@@ -91,6 +114,9 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       dcVal: null,
       // inv 8: the resolving draw must match the announcement's initiator
       initiator: a.initiator === 'player' ? 'player' : 'gm',
+      // Client-only modifier choices cannot be recovered. Require a fresh,
+      // explicit choice before reveal so a reload never substitutes a default.
+      recovered: true,
     });
   }, [table, overlay, typeById]);
   const slots = table?.slots ?? [];
@@ -106,22 +132,64 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
 
   const armedSlot = slots.find((s) => s.id === armed.slot) ?? null;
 
+  const clearPending = useCallback(() => {
+    setPendingModifier(null);
+    setManualEditing(false);
+  }, []);
+
+  const applyArm = useCallback((next: Armed) => {
+    if (next.slot !== armed.slot || next.type !== armed.type || (!armed.batch && next.batch)) clearPending();
+    setArmed(next);
+  }, [armed, clearPending]);
+
+  const profileMapFor = useCallback((slot: SlotInfo): Record<string, number> =>
+    (slot.role === 'player' ? table?.sheets : table?.npc_sheets)?.[slot.id] ?? {}, [table]);
+  const defaultProfileFor = useCallback((slot: SlotInfo, typeId: string): string | undefined =>
+    table?.profile_defaults[slot.id]?.[typeId], [table]);
+  const modifierFor = useCallback((slot: SlotInfo, typeId: string): number | undefined => {
+    const profile = defaultProfileFor(slot, typeId);
+    return profile === undefined ? undefined : profileMapFor(slot)[profile];
+  }, [defaultProfileFor, profileMapFor]);
+
+  const orderedProfiles = useCallback((slot: SlotInfo, typeId: string): string[] => {
+    const profiles = profileMapFor(slot);
+    const names = Object.keys(profiles).filter((name) => Number.isInteger(profiles[name])).sort();
+    const preferred = defaultProfileFor(slot, typeId);
+    return preferred && names.includes(preferred)
+      ? [preferred, ...names.filter((name) => name !== preferred)] : names;
+  }, [defaultProfileFor, profileMapFor]);
+
+  const cycleProfile = useCallback((slot: SlotInfo, typeId: string) => {
+    const names = orderedProfiles(slot, typeId);
+    if (!names.length) { say('no saved profiles — add one on /sheets or press m'); return; }
+    const current = pendingModifier?.kind === 'profile'
+      ? pendingModifier.name : defaultProfileFor(slot, typeId);
+    const at = current ? names.indexOf(current) : -1;
+    const name = names[(at + 1 + names.length) % names.length];
+    setPendingModifier({ kind: 'profile', name, value: profileMapFor(slot)[name] });
+    setManualEditing(false);
+  }, [pendingModifier, orderedProfiles, defaultProfileFor, profileMapFor, say]);
+
+  const makePendingDefault = useCallback(async () => {
+    if (!table || !armedSlot || !armed.type || pendingModifier?.kind !== 'profile' || armed.batch) return;
+    try {
+      await api('/api/profile-defaults', {
+        slot: armedSlot.id,
+        defaults: { ...(table.profile_defaults[armedSlot.id] ?? {}), [armed.type]: pendingModifier.name },
+      });
+      await refreshTable();
+      say(`${pendingModifier.name} is now the default for ${armed.type}`);
+    } catch (e: any) { say(e.message); }
+  }, [table, armedSlot, armed, pendingModifier, refreshTable, say]);
+
   /** check types the armed slot can use, with stable hotkey letters. */
   const scopedTypes = useMemo(() => {
     if (!armedSlot) return [] as (CheckType & { key: string })[];
-    const used = new Set(RESERVED_KEYS);
-    return registry
-      .filter((t) => t.roles.includes(armedSlot.role ?? '') && armedSlot.lanes.includes(t.lane))
-      .map((t) => {
-        let key = '';
-        for (const ch of t.id) if (/[a-z]/.test(ch) && !used.has(ch)) { key = ch; break; }
-        if (key) used.add(key);
-        return { ...t, key };
-      });
+    return assignTypeHotkeys(registry
+      .filter((t) => t.roles.includes(armedSlot.role ?? '') && armedSlot.lanes.includes(t.lane)));
   }, [registry, armedSlot]);
 
   const push = (line: Omit<LogLine, 'id' | 't'>) => setLog((l) => [{ id: ++logId, t: nowT(), ...line }, ...l].slice(0, 200));
-  const say = (m: string) => { setFlash(m); setTimeout(() => setFlash(null), 2600); };
 
   const armDigit = useCallback((key: string) => {
     const digit = Number(key);
@@ -130,18 +198,18 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       ?? registry.find((t) => t.roles.includes('world') && world?.lanes.includes(t.lane));
     if (digit >= 1 && digit <= PLAYER_KEY_COUNT) {
       const p = players[digit - 1];
-      if (p) setArmed((a) => ({ slot: p.id, type: a.type && typeById[a.type]?.roles.includes('player') ? a.type : null, batch: false }));
+      if (p) applyArm({ slot: p.id, type: armed.type && typeById[armed.type]?.roles.includes('player') ? armed.type : null, batch: false });
       else say('no player assigned to that key');
     } else if (digit >= FIRST_NPC_KEY && digit <= LAST_NPC_KEY) {
       const n = npcs.find((x) => x.id === bench[digit - FIRST_NPC_KEY]);
-      if (n) setArmed((a) => ({ slot: n.id, type: a.type && typeById[a.type]?.roles.includes('npc') ? a.type : null, batch: false }));
+      if (n) applyArm({ slot: n.id, type: armed.type && typeById[armed.type]?.roles.includes('npc') ? armed.type : null, batch: false });
       else say('no NPC pinned on that key — pin from the bench');
     } else if (key === '9' && world) {
-      setArmed({ slot: world.id, type: worldType('routine')?.id ?? null, batch: false });
+      applyArm({ slot: world.id, type: worldType('routine')?.id ?? null, batch: false });
     } else if (key === '0' && world) {
-      setArmed({ slot: world.id, type: worldType('deep')?.id ?? null, batch: false });
+      applyArm({ slot: world.id, type: worldType('deep')?.id ?? null, batch: false });
     }
-  }, [players, npcs, bench, world, registry, typeById]);
+  }, [players, npcs, bench, world, registry, typeById, armed, applyArm]);
 
   const fire = useCallback(async () => {
     if (!armed.slot || !armed.type) { say('arm a slot and a check type first'); return; }
@@ -163,7 +231,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       } else if (type.ritual) {
         // an announcement is public and can only be resolved by a draw or a
         // void, so never write one we already know the draw will refuse
-        if (armedModifier === undefined) {
+        if (pendingModifier === null && modifierFor(armedSlot!, type.id) === undefined) {
           say('no default profile modifier recorded — fix it on /sheets before announcing');
           return;
         }
@@ -172,6 +240,8 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       } else {
         const res = await api('/api/draw', {
           draw_id: uuid(), slot: armed.slot, check_type: type.id, ...(dc !== null ? { dc } : {}),
+          ...(pendingModifier?.kind === 'profile' ? { profile: pendingModifier.name }
+            : pendingModifier?.kind === 'manual' ? { modifier: pendingModifier.value } : {}),
         });
         push({
           seq: res.entry.seq, who: armedSlot?.display ?? armed.slot, lane: res.entry.lane,
@@ -179,10 +249,11 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           mod: res.modifier ?? res.entry.modifier, dcVal: dc ?? undefined, kind: 'draw',
           openLane: res.entry.lane === 'open', npc: armedSlot?.role === 'npc',
         });
+        clearPending();
       }
       refreshTable(); onChange();
     } catch (e: any) { say(e.message); }
-  }, [armed, typeById, dc, players, armedSlot, refreshTable, onChange]);
+  }, [armed, typeById, dc, players, armedSlot, pendingModifier, modifierFor, clearPending, refreshTable, onChange]);
 
   // global keyboard (§7.3.2: keyboard-first; mouse works but is not the target)
   useEffect(() => {
@@ -199,15 +270,23 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         if (e.key >= '0' && e.key <= '9') { armDigit(e.key); return true; }
         if (e.key === 'Enter') { void fire(); return true; }
         if (e.key === '.') { setVeiled((v) => !v); return true; }
-        if (e.key === 'Escape') { setArmed({ slot: null, type: null, batch: false }); return true; }
+        if (e.key === 'Escape') { applyArm({ slot: null, type: null, batch: false }); return true; }
         if (e.key === 'b') {
-          if (armed.type && typeById[armed.type]?.roles.includes('player')) setArmed((a) => ({ ...a, batch: true }));
+          if (armed.type && typeById[armed.type]?.roles.includes('player')) applyArm({ ...armed, batch: true });
           else say('arm a player check type, then b for the party batch');
           return true;
         }
         if (e.key === 'd') { setDcEditing(true); return true; }
         if (e.key === 'm') {
-          say('manual modifiers arrive with the session 2 profile picker — edit saved profiles on /sheets');
+          if (armed.batch) say('manual modifiers are disabled during a batch');
+          else if (armedSlot && armed.type) setManualEditing(true);
+          else say('arm a slot and a check type first');
+          return true;
+        }
+        if (e.key === ',') {
+          if (armed.batch) say('profile selection is disabled during a batch');
+          else if (armedSlot && armed.type) cycleProfile(armedSlot, armed.type);
+          else say('arm a slot and a check type first');
           return true;
         }
         if (e.key === 'U') { setOverlay({ mode: 'correct' }); return true; }
@@ -219,7 +298,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         }
         if (/^[a-z]$/.test(e.key)) {
           const t = scopedTypes.find((x) => x.key === e.key);
-          if (t) { setArmed((a) => ({ ...a, type: t.id })); return true; }
+          if (t) { applyArm({ ...armed, type: t.id }); return true; }
         }
         return false;
       };
@@ -227,24 +306,17 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [overlay, armDigit, fire, armed, scopedTypes, typeById, onChange]);
+  }, [overlay, armDigit, fire, armed, armedSlot, scopedTypes, typeById, onChange, applyArm, cycleProfile, say]);
 
   if (!table) return <p className="dim">reaching the table…</p>;
 
   const armedType = armed.type ? typeById[armed.type] : null;
-  const defaultProfileFor = (slot: SlotInfo, typeId: string): string | undefined =>
-    table.profile_defaults[slot.id]?.[typeId];
-  // Mirrors server resolution: check type → private default pointer → the
-  // role-appropriate profile map. The check type never keys the sheet itself.
-  const modifierFor = (slot: SlotInfo, typeId: string): number | undefined => {
-    const profile = defaultProfileFor(slot, typeId);
-    return profile === undefined ? undefined
-      : (slot.role === 'player' ? table.sheets : table.npc_sheets)[slot.id]?.[profile];
-  };
-  const armedProfile: string | undefined = armedSlot && armed.type
+  const savedArmedProfile: string | undefined = armedSlot && armed.type
     ? defaultProfileFor(armedSlot, armed.type) : undefined;
-  const armedModifier: number | undefined = armedSlot && armed.type
+  const savedArmedModifier: number | undefined = armedSlot && armed.type
     ? modifierFor(armedSlot, armed.type) : undefined;
+  const displayedProfile = pendingModifier?.kind === 'profile' ? pendingModifier.name : savedArmedProfile;
+  const displayedModifier = pendingModifier?.value ?? savedArmedModifier;
   // a batch is atomic: one player's missing modifier refuses the whole thing,
   // so the warning has to cover everyone it would draw for
   const batchMissing: string[] = armed.batch && armed.type
@@ -262,7 +334,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
             {players.map((p, i) => (
               <SlotCard key={p.id} slot={p} digit={i < PLAYER_KEY_COUNT ? String(i + 1) : '·'} lanes={table.lanes}
                 armed={armed.slot === p.id} veilName={false} veiled={veiled}
-                onArm={() => setArmed((a) => ({ slot: p.id, type: a.type && typeById[a.type]?.roles.includes('player') ? a.type : null, batch: false }))} />
+                onArm={() => applyArm({ slot: p.id, type: armed.type && typeById[armed.type]?.roles.includes('player') ? armed.type : null, batch: false })} />
             ))}
           </div>
           {overflowPlayers.length > 0 && <p className="rubric">{overflowPlayers.map((p) => p.display ?? p.id).join(', ')} {overflowPlayers.length === 1 ? 'has' : 'have'} no numeric hotkey, but {overflowPlayers.length === 1 ? 'is' : 'are'} included in party-wide batches.</p>}
@@ -275,7 +347,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
                 return (
                   <SlotCard key={n.id} slot={n} digit={pin >= 0 && pin < NPC_BENCH_CAPACITY ? String(FIRST_NPC_KEY + pin) : '·'} lanes={table.lanes}
                     armed={armed.slot === n.id} veilName veiled={veiled}
-                    onArm={() => setArmed({ slot: n.id, type: null, batch: false })}
+                    onArm={() => applyArm({ slot: n.id, type: null, batch: false })}
                     extra={
                       <button className="btn ghost" onClick={(e) => {
                         e.stopPropagation();
@@ -335,22 +407,51 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         <span className="who">{armedSlot
           ? <span className={armedSlot.role === 'npc' ? 'veilable' + (veiled ? ' veiled' : '') : ''}>{armedSlot.display ?? armedSlot.id}</span>
           : <span className="faint">{HOTKEY_LEGEND}</span>}{armed.batch && <span className="brass"> ×{players.length} batch</span>}</span>
-        {scopedTypes.map((t) => (
-          <button key={t.id} className={'typechip' + (armed.type === t.id ? ' armed' : '')}
-            onClick={() => setArmed((a) => ({ ...a, type: t.id }))}>
-            <span className="keycap">{t.key || '·'}</span>{t.id}{t.ritual && <span className="rubricdot" title="ritual: announce, then reveal" />}
-          </button>
+        {scopedTypes.map((t, i) => (
+          <Fragment key={t.id}>
+            {armedSlot?.role === 'player' && i > 0 && scopedTypes[i - 1].ritual && !t.ritual
+              && <span className="type-divider" title="major / routine" aria-label="major / routine divider" />}
+            <button className={'typechip' + (armed.type === t.id ? ' armed' : '')}
+              onClick={() => applyArm({ ...armed, type: t.id })}>
+              <span className="keycap">{t.key || '·'}</span>{t.id}{t.ritual && <span className="rubricdot" title="ritual: announce, then reveal" />}
+            </button>
+          </Fragment>
         ))}
         {armedSlot && (
           // A draw is refused outright without a modifier, so it must be
           // visible before Enter rather than discovered by the error.
-          <span className={'typechip dcchip' + (armedModifier === undefined ? ' armed' : '')}>
-            <span className="keycap">m</span>mod{' '}
-            <button className={'btn ghost' + (armedModifier === undefined ? ' rubric' : '')}
-              title={armedModifier === undefined ? 'no default profile modifier recorded — a draw will be refused' : `from profile ${armedProfile}`}
-              onClick={() => say('edit saved profiles and defaults on /sheets')}>
-              {armedModifier === undefined ? 'not set' : `${armedProfile} ${armedModifier >= 0 ? `+${armedModifier}` : armedModifier}`}
-            </button>
+          <span className={'typechip dcchip' + (displayedModifier === undefined ? ' armed' : '')}>
+            <span className="keycap">,</span><span className="keycap">m</span>mod{' '}
+            <span className="modifier-actions">
+              {manualEditing
+                ? <input autoFocus aria-label="manual modifier" defaultValue={pendingModifier?.kind === 'manual' ? pendingModifier.value : ''}
+                    onBlur={() => setManualEditing(false)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        const raw = (e.target as HTMLInputElement).value.trim();
+                        const value = Number(raw);
+                        if (raw !== '' && Number.isInteger(value)) {
+                          setPendingModifier({ kind: 'manual', value }); setManualEditing(false);
+                        } else say('manual modifier must be an integer');
+                      }
+                      if (e.key === 'Escape') setManualEditing(false);
+                    }} />
+                : <button className={'btn ghost' + (displayedModifier === undefined ? ' rubric' : '')}
+                    disabled={armed.batch || !armed.type}
+                    title={displayedModifier === undefined
+                      ? 'no default profile modifier recorded — a draw will be refused'
+                      : pendingModifier?.kind === 'manual' ? 'manual override'
+                        : `${pendingModifier ? 'pending profile' : 'from profile'} ${displayedProfile}`}
+                    onClick={() => armed.type && cycleProfile(armedSlot, armed.type)}>
+                    {displayedModifier === undefined ? 'not set'
+                      : pendingModifier?.kind === 'manual' ? `manual ${displayedModifier >= 0 ? `+${displayedModifier}` : displayedModifier}`
+                        : `${displayedProfile} ${displayedModifier >= 0 ? `+${displayedModifier}` : displayedModifier}`}
+                  </button>}
+              {!manualEditing && <button className="btn ghost" disabled={armed.batch || !armed.type}
+                onClick={() => setManualEditing(true)}>manual</button>}
+              {pendingModifier?.kind === 'profile' && pendingModifier.name !== savedArmedProfile && !armed.batch
+                && <button className="btn ghost" onClick={() => void makePendingDefault()}>make default</button>}
+            </span>
           </span>
         )}
         {armedSlot && (
@@ -369,11 +470,12 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           <span className="flash">batch needs a modifier for {batchMissing.join(', ')}</span>
         )}
         {flash && <span className="flash">{flash}</span>}
-        <span className="hint">Enter draws{armedType?.ritual ? ' → announce' : ''} · m reserved · d DC · b batch · . veil · U correct · C close &amp; publish</span>
+        <span className="hint">Enter draws{armedType?.ritual ? ' → announce' : ''} · , profile · m manual · d DC · b batch · . veil · U correct · C close &amp; publish</span>
       </div>
 
       {overlay && <OverlayHost overlay={overlay} setOverlay={setOverlay} table={table} status={status}
         typeById={typeById} dc={dc} push={push} say={say}
+        pendingModifier={pendingModifier} setPendingModifier={setPendingModifier} clearPending={clearPending}
         refresh={async () => { await refreshTable(); onChange(); }} log={log} />}
     </div>
   );
@@ -427,14 +529,16 @@ function OverlayHost(props: {
   overlay: Overlay; setOverlay: (o: Overlay | null) => void; table: TableState;
   status: Status & { session_open?: boolean }; typeById: Record<string, CheckType>;
   dc: number | null; push: (l: any) => void; say: (m: string) => void; refresh: () => Promise<void>;
-  log: LogLine[];
+  log: LogLine[]; pendingModifier: PendingModifier | null;
+  setPendingModifier: (pending: PendingModifier | null) => void; clearPending: () => void;
 }) {
   const { overlay, setOverlay, table, typeById, push, say, refresh, log } = props;
   const close = () => setOverlay(null);
   const slotName = (id: string) => table.slots.find((s) => s.id === id)?.display ?? id;
 
   if (overlay.mode === 'context') return <ContextSheet {...{ overlay, setOverlay, typeById, close, say, dc: props.dc }} slotName={slotName(overlay.slot)} />;
-  if (overlay.mode === 'announced') return <Announced {...{ overlay, setOverlay, typeById, push, say, refresh, close }} slotName={slotName(overlay.slot)} />;
+  if (overlay.mode === 'announced') return <Announced {...{ overlay, setOverlay, typeById, table, push, say, refresh, close,
+    pendingModifier: props.pendingModifier, setPendingModifier: props.setPendingModifier, clearPending: props.clearPending }} slotName={slotName(overlay.slot)} />;
   if (overlay.mode === 'numeral') {
     const total = overlay.mod !== undefined ? overlay.roll + overlay.mod : null;
     const degree = total !== null && overlay.dcVal !== undefined
@@ -455,7 +559,7 @@ function OverlayHost(props: {
       </div>
     );
   }
-  if (overlay.mode === 'void') return <VoidSheet {...{ overlay, push, say, refresh, close }} slotName={slotName(overlay.slot)} />;
+  if (overlay.mode === 'void') return <VoidSheet {...{ overlay, push, say, refresh, close, clearPending: props.clearPending }} slotName={slotName(overlay.slot)} />;
   if (overlay.mode === 'correct') return <CorrectSheet {...{ log, table, push, say, refresh, close }} />;
   if (overlay.mode === 'closing') return <CloseSession {...{ status: props.status, close, say, refresh }} />;
   if (overlay.mode === 'publish') return <PublishSheet {...{ close, say, refresh }} />;
@@ -473,7 +577,7 @@ function ContextSheet({ overlay, setOverlay, typeById, close, say, dc, slotName 
       setOverlay({
         mode: 'announced', slot: overlay.slot, typeId: type.id,
         announceSeq: entry.seq, context,
-        dcVal: dcVal === '' ? null : parseInt(dcVal, 10), initiator,
+        dcVal: dcVal === '' ? null : parseInt(dcVal, 10), initiator, recovered: false,
       });
     } catch (e: any) { say(e.message); close(); }
   };
@@ -498,16 +602,42 @@ function ContextSheet({ overlay, setOverlay, typeById, close, say, dc, slotName 
   );
 }
 
-function Announced({ overlay, setOverlay, typeById, push, say, refresh, close, slotName }: any) {
+function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, slotName,
+  pendingModifier, setPendingModifier, clearPending }: any) {
   const type = typeById[overlay.typeId];
+  const slot = table.slots.find((s: SlotInfo) => s.id === overlay.slot);
+  const profiles: Record<string, number> = slot
+    ? (slot.role === 'player' ? table.sheets : table.npc_sheets)[slot.id] ?? {} : {};
+  const defaultName: string | undefined = table.profile_defaults[overlay.slot]?.[type.id];
+  const names = Object.keys(profiles).filter((name) => Number.isInteger(profiles[name])).sort();
+  const ordered = defaultName && names.includes(defaultName)
+    ? [defaultName, ...names.filter((name) => name !== defaultName)] : names;
+  const [manualEditing, setManualEditing] = useState(false);
+  const confirmed = !overlay.recovered || pendingModifier !== null;
+
+  const chooseProfile = (name: string) => {
+    if (!Number.isInteger(profiles[name])) { say(`profile ${name} has no integer modifier`); return; }
+    setPendingModifier({ kind: 'profile', name, value: profiles[name] });
+    setManualEditing(false);
+  };
+  const cycle = () => {
+    if (!ordered.length) { say('no saved profiles — press m for a manual modifier'); return; }
+    const current = pendingModifier?.kind === 'profile' ? pendingModifier.name : defaultName;
+    const at = current ? ordered.indexOf(current) : -1;
+    chooseProfile(ordered[(at + 1 + ordered.length) % ordered.length]);
+  };
   const reveal = async () => {
+    if (!confirmed) { say('confirm a modifier before revealing this recovered announcement'); return; }
     try {
       const res = await api('/api/draw', {
         draw_id: uuid(), slot: overlay.slot, check_type: type.id,
         announce_seq: overlay.announceSeq, initiator: overlay.initiator,
         ...(overlay.dcVal !== null ? { dc: overlay.dcVal } : {}),
+        ...(pendingModifier?.kind === 'profile' ? { profile: pendingModifier.name }
+          : pendingModifier?.kind === 'manual' ? { modifier: pendingModifier.value } : {}),
       });
       push({ seq: res.entry.seq, who: slotName, lane: res.entry.lane, position: res.entry.position, desc: `${type.id} · ritual`, roll: res.roll, mod: res.modifier ?? res.entry.modifier, dcVal: overlay.dcVal ?? undefined, kind: 'draw', ritual: true });
+      clearPending();
       refresh();
       setOverlay({ mode: 'numeral', roll: res.roll, mod: res.modifier ?? res.entry.modifier, dcVal: overlay.dcVal ?? undefined, label: `${slotName} · ${type.label}` });
     } catch (e: any) {
@@ -519,7 +649,16 @@ function Announced({ overlay, setOverlay, typeById, push, say, refresh, close, s
   return (
     <div className="overlay" tabIndex={-1} ref={(el) => el?.focus()}
       onKeyDown={(e) => {
+        const target = e.target as HTMLElement;
+        if (['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) {
+          if (e.key === 'Enter' && target.getAttribute('aria-label') === 'ritual DC') {
+            e.preventDefault(); void reveal();
+          }
+          return;
+        }
         if (e.key === 'Enter') { e.preventDefault(); void reveal(); }
+        if (e.key === ',') { e.preventDefault(); cycle(); }
+        if (e.key === 'm') { e.preventDefault(); setManualEditing(true); }
         if (e.key === 'v') { e.preventDefault(); setOverlay({ mode: 'void', slot: overlay.slot, announceSeq: overlay.announceSeq }); }
       }}>
       <div className="ceremony">
@@ -531,15 +670,49 @@ function Announced({ overlay, setOverlay, typeById, push, say, refresh, close, s
             after a reload gets the DC its client-side state lost. */}
         <p className="sub">
           <span className="typechip dcchip">DC{' '}
-            <input style={{ width: '3.5rem' }} defaultValue={overlay.dcVal ?? ''}
+            <input aria-label="ritual DC" style={{ width: '3.5rem' }} defaultValue={overlay.dcVal ?? ''}
               onChange={(e) => {
                 const v = parseInt(e.target.value, 10);
                 setOverlay({ ...overlay, dcVal: Number.isFinite(v) ? v : null });
               }} />
           </span>
         </p>
+        <div className="modifier-actions" style={{ justifyContent: 'center', flexWrap: 'wrap' }}>
+          <span className="typechip">
+            <span className="keycap">,</span>profile{' '}
+            <select aria-label="ritual profile" value={pendingModifier?.kind === 'profile' ? pendingModifier.name : ''}
+              onChange={(e) => e.target.value && chooseProfile(e.target.value)}>
+              <option value="">— choose —</option>
+              {ordered.map((name) => <option key={name} value={name}>{name} {profiles[name] >= 0 ? `+${profiles[name]}` : profiles[name]}</option>)}
+            </select>
+          </span>
+          {manualEditing
+            ? <span className="typechip"><span className="keycap">m</span>
+                <input autoFocus aria-label="ritual manual modifier" defaultValue={pendingModifier?.kind === 'manual' ? pendingModifier.value : ''}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault(); e.stopPropagation();
+                      const raw = (e.target as HTMLInputElement).value.trim(); const value = Number(raw);
+                      if (raw !== '' && Number.isInteger(value)) { setPendingModifier({ kind: 'manual', value }); setManualEditing(false); }
+                      else say('manual modifier must be an integer');
+                    }
+                    if (e.key === 'Escape') { e.stopPropagation(); setManualEditing(false); }
+                  }} />
+              </span>
+            : <button className="btn" onClick={() => setManualEditing(true)}>m — manual</button>}
+          <button className="btn" disabled={!defaultName || !Number.isInteger(profiles[defaultName])}
+            onClick={() => defaultName && chooseProfile(defaultName)}>use current default</button>
+        </div>
+        <p className={'sub ' + (confirmed ? 'open-c' : 'rubric')}>
+          {pendingModifier?.kind === 'profile'
+            ? `Selected ${pendingModifier.name} ${pendingModifier.value >= 0 ? `+${pendingModifier.value}` : pendingModifier.value}`
+            : pendingModifier?.kind === 'manual'
+              ? `Selected manual ${pendingModifier.value >= 0 ? `+${pendingModifier.value}` : pendingModifier.value}`
+              : overlay.recovered ? 'Confirm a modifier before Reveal.'
+                : `Current default: ${defaultName ?? 'not set'}${defaultName && Number.isInteger(profiles[defaultName]) ? ` ${profiles[defaultName] >= 0 ? '+' : ''}${profiles[defaultName]}` : ''}`}
+        </p>
         <div className="actions">
-          <button className="btn primary" onClick={reveal}>Reveal — Enter</button>
+          <button className="btn primary" disabled={!confirmed} onClick={reveal}>Reveal — Enter</button>
           <button className="btn rubric" onClick={() => setOverlay({ mode: 'void', slot: overlay.slot, announceSeq: overlay.announceSeq })}>Void — v</button>
         </div>
         <p className="sub faint">The announcement is public. Only reveal or void can follow it.</p>
@@ -548,7 +721,7 @@ function Announced({ overlay, setOverlay, typeById, push, say, refresh, close, s
   );
 }
 
-function VoidSheet({ overlay, push, say, refresh, close, slotName }: any) {
+function VoidSheet({ overlay, push, say, refresh, close, slotName, clearPending }: any) {
   const [reason, setReason] = useState('');
   const doVoid = async () => {
     try {
@@ -557,6 +730,7 @@ function VoidSheet({ overlay, push, say, refresh, close, slotName }: any) {
       // await before closing: the recovery effect reads open_announce, and a
       // stale read would resurrect ANNOUNCED for the ritual just voided
       await refresh();
+      clearPending();
       close();
     } catch (e: any) { say(e.message); close(); }
   };

@@ -132,6 +132,10 @@ details.npcs summary::-webkit-details-marker { display: none; }
 .armedbar .hint { font-family: var(--font-data); font-size: .72rem; color: var(--ink-faint); margin-left: auto; }
 .armedbar .flash { color: var(--rubric); font-size: .8rem; }
 .dcchip input { width: 3.2rem; font-family: var(--font-data); text-align: center; padding: .1rem .2rem; }
+.type-divider { align-self: stretch; width: 1px; background: var(--line); margin: .1rem .15rem; }
+.modifier-actions { display: inline-flex; align-items: center; gap: .25rem; }
+.modifier-actions .btn { padding: .08rem .35rem; font-size: .72rem; }
+.modifier-actions input { width: 4rem; font-family: var(--font-data); text-align: center; padding: .1rem .2rem; }
 
 /* session log */
 .log { background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--r); padding: .5rem .65rem; max-height: 72vh; overflow-y: auto; }
@@ -201,6 +205,12 @@ details.npcs summary::-webkit-details-marker { display: none; }
 
 /* ============================== views ==================================== */
 .pane { background: var(--paper-2); border: 1px solid var(--line); border-radius: 6px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
+.profile-editor { display: grid; grid-template-columns: minmax(18rem, .8fr) minmax(24rem, 1.2fr); gap: 1.25rem; }
+.profile-row { display: grid; grid-template-columns: minmax(10rem, 1fr) 4.5rem auto; gap: .4rem; margin: .4rem 0; }
+.profile-row .profile-value { width: 100%; text-align: center; font-family: var(--font-data); }
+.default-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .45rem .7rem; margin-top: .4rem; }
+.sheet-actions { display: flex; align-items: flex-end; justify-content: flex-end; gap: .7rem; margin-top: .9rem; padding-top: .7rem; border-top: 1px solid var(--line-soft); }
+@media (max-width: 760px) { .profile-editor { grid-template-columns: 1fr; } }
 .bars20 { display: flex; align-items: flex-end; gap: 2px; height: 56px; max-width: 26rem; }
 .bars20 div { flex: 1; background: var(--seal-dim); min-height: 2px; position: relative; }
 .bars20 div.mid { border-right: 2px solid var(--rubric); }

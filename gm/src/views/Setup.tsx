@@ -6,21 +6,26 @@
 import { useEffect, useState } from 'react';
 import { api, Status } from '../api';
 
-// §2.5 suggested starting registry — the GM edits at the ceremony
-const SUGGESTED_REGISTRY = [
-  { id: 'rk-cosmology', label: 'Recall Knowledge — cosmology', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
-  { id: 'lore-mystery', label: 'Lore — the central mystery', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
-  { id: 'divination', label: 'Divination and omens', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
-  { id: 'rk-general', label: 'Recall Knowledge — general', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
+// Campaign reconciliation, Part 2. Registry order is significant: it drives
+// the table's stable first-free-letter hotkeys.
+export const SUGGESTED_REGISTRY = [
+  { id: 'cosmology-major', label: 'Major cosmology inquiry', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
+  { id: 'research-major', label: 'Major research check', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
+  { id: 'investigation-major', label: 'Major investigation check', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: true },
+  { id: 'rk-general', label: 'Recall Knowledge', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
+  { id: 'lore-roots', label: 'Recall Knowledge — roots Lore', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
   { id: 'perception-secret', label: 'Secret Perception', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
   { id: 'sense-motive', label: 'Sense Motive', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
-  { id: 'decipher-identify', label: 'Decipher Writing / Identify Magic', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
-  { id: 'npc-public', label: 'NPC check the table watched', lane: 'open', roles: ['npc'], seal_dc: false, seal_modifier: true, ritual: false },
+  { id: 'decipher-identify', label: 'Decipher / Identify', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
+  { id: 'gather-information', label: 'Gather Information', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
+  { id: 'secret-skill-other', label: 'Other secret skill check', lane: 'sealed', roles: ['player'], seal_dc: true, seal_modifier: false, ritual: false },
   { id: 'npc-secret', label: 'NPC secret check', lane: 'deep', roles: ['npc'], seal_dc: true, seal_modifier: true, ritual: false },
+  { id: 'npc-public', label: 'NPC check the table watched', lane: 'open', roles: ['npc'], seal_dc: false, seal_modifier: true, ritual: false },
   { id: 'world-routine', label: 'World — routine', lane: 'routine', roles: ['world'], seal_dc: true, seal_modifier: true, ritual: false },
-  { id: 'world-plot', label: 'World — plot', lane: 'deep', roles: ['world'], seal_dc: true, seal_modifier: true, ritual: true },
+  { id: 'world-major', label: 'World — major', lane: 'deep', roles: ['world'], seal_dc: true, seal_modifier: true, ritual: true },
   { id: 'public-gm-check', label: 'Public GM check', lane: 'open', roles: ['player', 'npc', 'world'], seal_dc: false, seal_modifier: false, ritual: false },
 ];
+export const DEFAULT_CONTEXT_PRIVACY = 'sealed';
 
 const STEPS = ['pre-commit', 'roster & lanes', 'registry', 'parameters', 'player entropy', 'review', 'genesis'];
 const DEFAULT_PLAYER_COUNT = 5;
@@ -48,7 +53,7 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
   const [registry, setRegistry] = useState(SUGGESTED_REGISTRY.map((r) => ({ ...r, roles: r.roles.join(',') })));
   const [params, setParams] = useState({
     campaign: '', chain_length: 20000, reserve_total: 64,
-    context_privacy: 'plain', disclosure_policy:
+    context_privacy: DEFAULT_CONTEXT_PRIVACY, disclosure_policy:
       'Sealed and deep lanes: opened no less than two story arcs after the draw. Open lane: opened at each session-close. Routine lane: opened at each arc-close. Full reveal at campaign end.',
   });
   const [preview, setPreview] = useState<{

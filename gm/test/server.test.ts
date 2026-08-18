@@ -559,12 +559,14 @@ describe('modifier profiles and planned draws', () => {
     await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
     await campaign.sessionOpen();
     await expect(campaign.draw({ slot: 'slot-01', check_type: 'rk-general' })).rejects.toThrow(/no modifier recorded/);
+    expect(campaign.tableState().sheets['slot-01']).toBeUndefined();
     clock.advance(24 * 3600 * 1000);
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 10 } });
     const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general' });
     expect(draw.modifier).toBe(10);
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 99 } });
     expect((campaign as any).playerSheetMod('slot-01', 'Society', draw.entry.seq, '2026-08-15')).toBe(10);
+    expect(campaign.tableState().sheets['slot-01']).toEqual({ Society: 10 });
   });
 
   it('replaces NPC maps, rejects dates, and keeps defaults private', async () => {
