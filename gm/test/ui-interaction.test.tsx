@@ -307,6 +307,38 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     });
   }, 20_000);
 
+  it('saves filled late DCs before close and refuses C without an open session', async () => {
+    fireEvent.keyDown(window, { key: '1' });
+    const rk = await screen.findByText('rk-general');
+    fireEvent.keyDown(window, { key: rk.closest('button')!.querySelector('.keycap')!.textContent! });
+    const before = draws().length;
+    fireEvent.keyDown(window, { key: 'Enter' });
+    await waitFor(() => expect(draws()).toHaveLength(before + 1));
+    const target = draws().at(-1);
+    expect(target.dc).toBeUndefined();
+    expect(target.dc_commit).toBeUndefined();
+
+    fireEvent.keyDown(window, { key: 'C' });
+    const input = await screen.findByLabelText(`DC for draw ${target.seq}`);
+    fireEvent.change(input, { target: { value: '19' } });
+    // The final action must honor filled rows without requiring each small
+    // per-row button to be clicked first.
+    fireEvent.click(screen.getByText('Close, disclose open lanes, publish'));
+    await screen.findByText(/Published\. Post this digest/);
+    await waitFor(() => expect(campaign.status().session_open).toBe(false));
+    expect(campaign.ledgerJson().entries.filter((entry: any) =>
+      entry.kind === 'dc-late' && entry.target_seq === target.seq)).toHaveLength(1);
+
+    fireEvent.click(screen.getByText('Done'));
+    fireEvent.keyDown(window, { key: 'C' });
+    expect(document.querySelector('.overlay')).toBeNull();
+    expect(await screen.findByText('no session is open — press O to open one or P to publish')).toBeTruthy();
+
+    // Restore the shared fixture for the remaining interaction tests.
+    fireEvent.keyDown(window, { key: 'O' });
+    await waitFor(() => expect(campaign.status().session_open).toBe(true));
+  }, 20_000);
+
   it('warns before an atomic batch when one player has no default profile', async () => {
     const defaults = { ...campaign.tableState().profile_defaults['slot-05'] };
     delete defaults['rk-general'];

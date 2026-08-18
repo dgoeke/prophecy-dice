@@ -61,7 +61,7 @@ interface Armed { slot: string | null; type: string | null; batch: boolean }
 let logId = 0;
 const nowT = () => new Date().toTimeString().slice(0, 5);
 
-export function Table({ status, onChange }: { status: Status & { session_open?: boolean }; onChange: () => void }) {
+export function Table({ status, onChange }: { status: Status & { session_open?: boolean }; onChange: () => void | Promise<void> }) {
   const [table, setTable] = useState<TableState | null>(null);
   const [armed, setArmed] = useState<Armed>({ slot: null, type: null, batch: false });
   const [pendingModifier, setPendingModifier] = useState<PendingModifier | null>(null);
@@ -291,7 +291,11 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         }
         if (e.key === 'U') { setOverlay({ mode: 'correct' }); return true; }
         if (e.key === 'P') { setOverlay({ mode: 'publish' }); return true; }
-        if (e.key === 'C') { setOverlay({ mode: 'closing' }); return true; }
+        if (e.key === 'C') {
+          if (status.session_open) setOverlay({ mode: 'closing' });
+          else say('no session is open — press O to open one or P to publish');
+          return true;
+        }
         if (e.key === 'O') {
           void api('/api/session/open', {}).then(() => { onChange(); say('session opened'); }).catch((er) => say(er.message));
           return true;
@@ -306,7 +310,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [overlay, armDigit, fire, armed, armedSlot, scopedTypes, typeById, onChange, applyArm, cycleProfile, say]);
+  }, [overlay, armDigit, fire, armed, armedSlot, scopedTypes, typeById, status.session_open, onChange, applyArm, cycleProfile, say]);
 
   if (!table) return <p className="dim">reaching the table…</p>;
 
@@ -478,7 +482,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       {overlay && <OverlayHost overlay={overlay} setOverlay={setOverlay} table={table} status={status}
         typeById={typeById} dc={dc} push={push} say={say}
         pendingModifier={pendingModifier} setPendingModifier={setPendingModifier} clearPending={clearPending}
-        refresh={async () => { await refreshTable(); onChange(); }} log={log} />}
+        refresh={async () => { await refreshTable(); await onChange(); }} log={log} />}
     </div>
   );
 }
@@ -799,6 +803,7 @@ function CloseSession({ status, close, say, refresh }: any) {
   const [stage, setStage] = useState<'review' | 'done'>('review');
   const [digest, setDigest] = useState<string | null>(null);
   const [dcInputs, setDcInputs] = useState<Record<number, string>>({});
+  const [working, setWorking] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -810,15 +815,38 @@ function CloseSession({ status, close, say, refresh }: any) {
   }, [status.session]);
 
   const sealDc = async (seq: number) => {
-    const v = parseInt(dcInputs[seq] ?? '', 10);
-    if (!Number.isFinite(v)) return say('enter a DC first');
-    try { await api('/api/dc-late', { target_seq: seq, dc: v }); setDcless((d) => d!.filter((e) => e.seq !== seq)); }
-    catch (e: any) { say(e.message); }
+    const raw = (dcInputs[seq] ?? '').trim();
+    const v = Number(raw);
+    if (raw === '' || !Number.isInteger(v)) return say('enter an integer DC first');
+    setWorking(true);
+    try {
+      await api('/api/dc-late', { target_seq: seq, dc: v });
+      setDcless((d) => d!.filter((e) => e.seq !== seq));
+    } catch (e: any) { say(e.message); }
+    finally { setWorking(false); }
   };
 
   const closeAndPublish = async () => {
+    if (!status.session_open) { say('no session is open'); close(); return; }
+    if (dcless === null) return say('still checking for missing DCs');
+    const supplied: { seq: number; dc: number }[] = [];
+    for (const entry of dcless) {
+      const raw = (dcInputs[entry.seq] ?? '').trim();
+      if (raw === '') continue;
+      const dc = Number(raw);
+      if (!Number.isInteger(dc)) return say(`DC for #${entry.seq} must be an integer`);
+      supplied.push({ seq: entry.seq, dc });
+    }
+    setWorking(true);
     try {
-      if (status.session_open) await api('/api/session/close', {});
+      // Filled rows are a promise to save, not disposable form state. Commit
+      // them before closing; blank rows are the explicit "leave DC-less"
+      // choice. Each successful row disappears even if a later request fails.
+      for (const item of supplied) {
+        await api('/api/dc-late', { target_seq: item.seq, dc: item.dc });
+        setDcless((d) => d!.filter((entry) => entry.seq !== item.seq));
+      }
+      await api('/api/session/close', {});
       // nightly open-lane disclosure through the current position (§4.3)
       const t = await api('/api/table');
       for (const [key, lane] of Object.entries<any>(t.lanes)) {
@@ -834,9 +862,10 @@ function CloseSession({ status, close, say, refresh }: any) {
           ? `WARNING: mirror command failed — post this head now (${pub.mirror})`
           : 'no mirror command configured — post this head now';
       setDigest(`${pub.digest}\n${witness}`);
+      await refresh();
       setStage('done');
-      refresh();
     } catch (e: any) { say(e.message); }
+    finally { setWorking(false); }
   };
 
   return (
@@ -851,14 +880,15 @@ function CloseSession({ status, close, say, refresh }: any) {
               : dcless.map((e) => (
                 <div className="row" key={e.seq}>
                   <span className="mono">#{e.seq} {e.slot}/{e.lane} pos {e.position} · {e.check_type}</span>
-                  <input style={{ width: '4rem' }} placeholder="DC" value={dcInputs[e.seq] ?? ''}
+                  <input aria-label={`DC for draw ${e.seq}`} style={{ width: '4rem' }} placeholder="DC"
+                    disabled={working} value={dcInputs[e.seq] ?? ''}
                     onChange={(ev) => setDcInputs((d) => ({ ...d, [e.seq]: ev.target.value }))} />
-                  <button className="btn" onClick={() => sealDc(e.seq)}>seal DC</button>
+                  <button className="btn" disabled={working} onClick={() => sealDc(e.seq)}>seal DC</button>
                 </div>
               ))}
             <footer>
-              <button className="btn ghost" onClick={close}>not yet</button>
-              <button className="btn primary" onClick={closeAndPublish}>Close, disclose open lanes, publish</button>
+              <button className="btn ghost" disabled={working} onClick={close}>not yet</button>
+              <button className="btn primary" disabled={dcless === null || working} onClick={closeAndPublish}>Close, disclose open lanes, publish</button>
             </footer>
           </>
         )}
