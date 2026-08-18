@@ -40,14 +40,20 @@ export function assignTypeHotkeys(types: CheckType[]): (CheckType & { key: strin
 interface LogLine {
   id: number; t: string; seq?: number; who: string; lane?: string; position?: number;
   desc: string; roll?: number; mod?: number; dcVal?: number; kind: 'draw' | 'void' | 'note';
-  openLane?: boolean; ritual?: boolean; npc?: boolean;
+  checkType?: string; openLane?: boolean; ritual?: boolean; npc?: boolean;
 }
+
+type AnnouncedOverlay = {
+  mode: 'announced'; slot: string; typeId: string; announceSeq: number; context: string;
+  dcVal: number | null; initiator: 'gm' | 'player'; recovered: boolean;
+  dcInput?: string; manualInput?: string; manualEditing?: boolean;
+};
 
 type Overlay =
   | { mode: 'context'; slot: string; typeId: string; }
-  | { mode: 'announced'; slot: string; typeId: string; announceSeq: number; context: string; dcVal: number | null; initiator: 'gm' | 'player'; recovered: boolean }
+  | AnnouncedOverlay
   | { mode: 'numeral'; roll: number; mod?: number; dcVal?: number; label: string }
-  | { mode: 'void'; slot: string; announceSeq: number }
+  | { mode: 'void'; announced: AnnouncedOverlay }
   | { mode: 'correct' }
   | { mode: 'closing' }
   | { mode: 'publish' };
@@ -60,8 +66,14 @@ interface Armed { slot: string | null; type: string | null; batch: boolean }
 
 let logId = 0;
 const nowT = () => new Date().toTimeString().slice(0, 5);
+const integerText = (raw: string): number | null => {
+  const trimmed = raw.trim();
+  if (trimmed === '') return null;
+  const value = Number(trimmed);
+  return Number.isInteger(value) ? value : null;
+};
 
-export function Table({ status, onChange }: { status: Status & { session_open?: boolean }; onChange: () => void | Promise<void> }) {
+export function Table({ status, onChange }: { status: Status; onChange: () => void | Promise<void> }) {
   const [table, setTable] = useState<TableState | null>(null);
   const [armed, setArmed] = useState<Armed>({ slot: null, type: null, batch: false });
   const [pendingModifier, setPendingModifier] = useState<PendingModifier | null>(null);
@@ -76,7 +88,11 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
   const [veiled, setVeiled] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
 
-  const refreshTable = useCallback(async () => setTable(await api<TableState>('/api/table')), []);
+  const refreshTable = useCallback(async () => {
+    const next = await api<TableState>('/api/table');
+    setTable(next);
+    return next;
+  }, []);
   const say = useCallback((m: string) => {
     setFlash(m);
     setTimeout(() => setFlash(null), 2600);
@@ -225,7 +241,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         res.entries.forEach((e: any, i: number) => push({
           seq: e.seq, who: players[i]?.display ?? e.slot, lane: e.lane, position: e.position,
           desc: `${type.id} · batch`, roll: res.rolls[i], mod: res.modifiers?.[i] ?? e.modifier,
-          dcVal: dc ?? undefined, kind: 'draw', openLane: e.lane === 'open',
+          dcVal: dc ?? undefined, kind: 'draw', checkType: type.id, openLane: e.lane === 'open',
         }));
         setArmed((a) => ({ ...a, batch: false }));
       } else if (type.ritual) {
@@ -246,7 +262,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         push({
           seq: res.entry.seq, who: armedSlot?.display ?? armed.slot, lane: res.entry.lane,
           position: res.entry.position, desc: type.id, roll: res.roll,
-          mod: res.modifier ?? res.entry.modifier, dcVal: dc ?? undefined, kind: 'draw',
+          mod: res.modifier ?? res.entry.modifier, dcVal: dc ?? undefined, kind: 'draw', checkType: type.id,
           openLane: res.entry.lane === 'open', npc: armedSlot?.role === 'npc',
         });
         clearPending();
@@ -290,14 +306,20 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           return true;
         }
         if (e.key === 'U') { setOverlay({ mode: 'correct' }); return true; }
-        if (e.key === 'P') { setOverlay({ mode: 'publish' }); return true; }
+        if (e.key === 'P') {
+          if (status.close_pending) setOverlay({ mode: 'closing' });
+          else if (status.session_open) say('close the session before publishing');
+          else setOverlay({ mode: 'publish' });
+          return true;
+        }
         if (e.key === 'C') {
-          if (status.session_open) setOverlay({ mode: 'closing' });
+          if (status.session_open || status.close_pending) setOverlay({ mode: 'closing' });
           else say('no session is open — press O to open one or P to publish');
           return true;
         }
         if (e.key === 'O') {
-          void api('/api/session/open', {}).then(() => { onChange(); say('session opened'); }).catch((er) => say(er.message));
+          if (status.close_pending) { setOverlay({ mode: 'closing' }); say('finish the pending publication first'); }
+          else void api('/api/session/open', {}).then(() => { onChange(); say('session opened'); }).catch((er) => say(er.message));
           return true;
         }
         if (/^[a-z]$/.test(e.key)) {
@@ -310,7 +332,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [overlay, armDigit, fire, armed, armedSlot, scopedTypes, typeById, status.session_open, onChange, applyArm, cycleProfile, say]);
+  }, [overlay, armDigit, fire, armed, armedSlot, scopedTypes, typeById, status.session_open, status.close_pending, onChange, applyArm, cycleProfile, say]);
 
   if (!table) return <p className="dim">reaching the table…</p>;
 
@@ -332,7 +354,8 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       <div className="tablewrap">
         <div>
           <div className="sectionhead"><span className="eyebrow">Players</span>
-            {!status.session_open && <button className="btn" onClick={() => api('/api/session/open', {}).then(onChange).catch((e) => say(e.message))}>Open session [O]</button>}
+            {!status.session_open && !status.close_pending && <button className="btn" onClick={() => api('/api/session/open', {}).then(onChange).catch((e) => say(e.message))}>Open session [O]</button>}
+            {status.close_pending && <button className="btn rubric" onClick={() => setOverlay({ mode: 'closing' })}>Finish publication</button>}
           </div>
           <div className="slotgrid players">
             {players.map((p, i) => (
@@ -466,7 +489,12 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
                   onFocus={(e) => e.currentTarget.select()}
                   onBlur={() => setDcEditing(false)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') { const v = parseInt((e.target as HTMLInputElement).value, 10); setDc(Number.isFinite(v) ? v : null); setDcEditing(false); }
+                    if (e.key === 'Enter') {
+                      const raw = (e.target as HTMLInputElement).value;
+                      const value = integerText(raw);
+                      if (raw.trim() !== '' && value === null) { say('DC must be an integer'); return; }
+                      setDc(value); setDcEditing(false);
+                    }
                     if (e.key === 'Escape') { setDc(null); setDcEditing(false); }
                   }} />
               : <button className="btn ghost" onClick={() => setDcEditing(true)}>{dc ?? '—'}</button>}
@@ -482,7 +510,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
       {overlay && <OverlayHost overlay={overlay} setOverlay={setOverlay} table={table} status={status}
         typeById={typeById} dc={dc} push={push} say={say}
         pendingModifier={pendingModifier} setPendingModifier={setPendingModifier} clearPending={clearPending}
-        refresh={async () => { await refreshTable(); await onChange(); }} log={log} />}
+        refresh={async () => { const next = await refreshTable(); await onChange(); return next; }} log={log} />}
     </div>
   );
 }
@@ -533,8 +561,8 @@ function SlotCard({ slot, digit, lanes, armed, onArm, veiled, veilName, note, ex
 
 function OverlayHost(props: {
   overlay: Overlay; setOverlay: (o: Overlay | null) => void; table: TableState;
-  status: Status & { session_open?: boolean }; typeById: Record<string, CheckType>;
-  dc: number | null; push: (l: any) => void; say: (m: string) => void; refresh: () => Promise<void>;
+  status: Status; typeById: Record<string, CheckType>;
+  dc: number | null; push: (l: any) => void; say: (m: string) => void; refresh: () => Promise<TableState>;
   log: LogLine[]; pendingModifier: PendingModifier | null;
   setPendingModifier: (pending: PendingModifier | null) => void; clearPending: () => void;
 }) {
@@ -542,7 +570,7 @@ function OverlayHost(props: {
   const close = () => setOverlay(null);
   const slotName = (id: string) => table.slots.find((s) => s.id === id)?.display ?? id;
 
-  if (overlay.mode === 'context') return <ContextSheet {...{ overlay, setOverlay, typeById, close, say, dc: props.dc }} slotName={slotName(overlay.slot)} />;
+  if (overlay.mode === 'context') return <ContextSheet {...{ overlay, setOverlay, typeById, close, say, refresh, dc: props.dc }} slotName={slotName(overlay.slot)} />;
   if (overlay.mode === 'announced') return <Announced {...{ overlay, setOverlay, typeById, table, push, say, refresh, close,
     pendingModifier: props.pendingModifier, setPendingModifier: props.setPendingModifier, clearPending: props.clearPending }} slotName={slotName(overlay.slot)} />;
   if (overlay.mode === 'numeral') {
@@ -565,26 +593,29 @@ function OverlayHost(props: {
       </div>
     );
   }
-  if (overlay.mode === 'void') return <VoidSheet {...{ overlay, push, say, refresh, close, clearPending: props.clearPending }} slotName={slotName(overlay.slot)} />;
+  if (overlay.mode === 'void') return <VoidSheet {...{ overlay, setOverlay, push, say, refresh, clearPending: props.clearPending }} slotName={slotName(overlay.announced.slot)} />;
   if (overlay.mode === 'correct') return <CorrectSheet {...{ log, table, push, say, refresh, close }} />;
   if (overlay.mode === 'closing') return <CloseSession {...{ status: props.status, close, say, refresh }} />;
   if (overlay.mode === 'publish') return <PublishSheet {...{ close, say, refresh }} />;
   return null;
 }
 
-function ContextSheet({ overlay, setOverlay, typeById, close, say, dc, slotName }: any) {
+function ContextSheet({ overlay, setOverlay, typeById, close, say, refresh, dc, slotName }: any) {
   const type = typeById[overlay.typeId];
   const [context, setContext] = useState<string>(type.label);
   const [initiator, setInitiator] = useState<'gm' | 'player'>('gm');
   const [dcVal, setDcVal] = useState<string>(dc !== null && dc !== undefined ? String(dc) : '');
   const announce = async () => {
+    const parsedDc = integerText(dcVal);
+    if (dcVal.trim() !== '' && parsedDc === null) { say('DC must be an integer'); return; }
     try {
       const entry = await api('/api/announce', { slot: overlay.slot, check_type: type.id, context, initiator });
       setOverlay({
         mode: 'announced', slot: overlay.slot, typeId: type.id,
         announceSeq: entry.seq, context,
-        dcVal: dcVal === '' ? null : parseInt(dcVal, 10), initiator, recovered: false,
+        dcVal: parsedDc, initiator, recovered: false,
       });
+      try { await refresh(); } catch (e: any) { say(`announced; refresh failed: ${e.message}`); }
     } catch (e: any) { say(e.message); close(); }
   };
   return (
@@ -618,13 +649,23 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
   const names = Object.keys(profiles).filter((name) => Number.isInteger(profiles[name])).sort();
   const ordered = defaultName && names.includes(defaultName)
     ? [defaultName, ...names.filter((name) => name !== defaultName)] : names;
-  const [manualEditing, setManualEditing] = useState(false);
-  const confirmed = !overlay.recovered || pendingModifier !== null;
+  const [manualEditing, setManualEditing] = useState(overlay.manualEditing ?? false);
+  const [manualInput, setManualInput] = useState(
+    overlay.manualInput ?? (pendingModifier?.kind === 'manual' ? String(pendingModifier.value) : ''),
+  );
+  const [dcInput, setDcInput] = useState(
+    overlay.dcInput ?? (overlay.dcVal === null ? '' : String(overlay.dcVal)),
+  );
+  const manualValue = manualEditing ? integerText(manualInput) : null;
+  const confirmed = manualEditing
+    ? manualInput.trim() !== '' && manualValue !== null
+    : !overlay.recovered || pendingModifier !== null;
 
   const chooseProfile = (name: string) => {
     if (!Number.isInteger(profiles[name])) { say(`profile ${name} has no integer modifier`); return; }
     setPendingModifier({ kind: 'profile', name, value: profiles[name] });
     setManualEditing(false);
+    setManualInput('');
   };
   const cycle = () => {
     if (!ordered.length) { say('no saved profiles — press m for a manual modifier'); return; }
@@ -632,20 +673,28 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
     const at = current ? ordered.indexOf(current) : -1;
     chooseProfile(ordered[(at + 1 + ordered.length) % ordered.length]);
   };
+  const enterVoid = () => setOverlay({
+    mode: 'void',
+    announced: { ...overlay, dcInput, manualInput, manualEditing },
+  });
   const reveal = async () => {
+    if (manualEditing && manualValue === null) { say('manual modifier must be an integer'); return; }
     if (!confirmed) { say('confirm a modifier before revealing this recovered announcement'); return; }
+    const dcValue = integerText(dcInput);
+    if (dcInput.trim() !== '' && dcValue === null) { say('DC must be an integer'); return; }
     try {
       const res = await api('/api/draw', {
         draw_id: uuid(), slot: overlay.slot, check_type: type.id,
         announce_seq: overlay.announceSeq, initiator: overlay.initiator,
-        ...(overlay.dcVal !== null ? { dc: overlay.dcVal } : {}),
-        ...(pendingModifier?.kind === 'profile' ? { profile: pendingModifier.name }
-          : pendingModifier?.kind === 'manual' ? { modifier: pendingModifier.value } : {}),
+        ...(dcValue !== null ? { dc: dcValue } : {}),
+        ...(manualEditing ? { modifier: manualValue }
+          : pendingModifier?.kind === 'profile' ? { profile: pendingModifier.name }
+            : pendingModifier?.kind === 'manual' ? { modifier: pendingModifier.value } : {}),
       });
-      push({ seq: res.entry.seq, who: slotName, lane: res.entry.lane, position: res.entry.position, desc: `${type.id} · ritual`, roll: res.roll, mod: res.modifier ?? res.entry.modifier, dcVal: overlay.dcVal ?? undefined, kind: 'draw', ritual: true });
+      push({ seq: res.entry.seq, who: slotName, lane: res.entry.lane, position: res.entry.position, desc: `${type.id} · ritual`, checkType: type.id, roll: res.roll, mod: res.modifier ?? res.entry.modifier, dcVal: dcValue ?? undefined, kind: 'draw', ritual: true });
       clearPending();
       refresh();
-      setOverlay({ mode: 'numeral', roll: res.roll, mod: res.modifier ?? res.entry.modifier, dcVal: overlay.dcVal ?? undefined, label: `${slotName} · ${type.label}` });
+      setOverlay({ mode: 'numeral', roll: res.roll, mod: res.modifier ?? res.entry.modifier, dcVal: dcValue ?? undefined, label: `${slotName} · ${type.label}` });
     } catch (e: any) {
       // stay on ANNOUNCED: the announcement is public and still unresolved,
       // so the GM must keep both Reveal and Void within reach
@@ -665,7 +714,7 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
         if (e.key === 'Enter') { e.preventDefault(); void reveal(); }
         if (e.key === ',') { e.preventDefault(); cycle(); }
         if (e.key === 'm') { e.preventDefault(); setManualEditing(true); }
-        if (e.key === 'v') { e.preventDefault(); setOverlay({ mode: 'void', slot: overlay.slot, announceSeq: overlay.announceSeq }); }
+        if (e.key === 'v') { e.preventDefault(); enterVoid(); }
       }}>
       <div className="ceremony">
         <div className="word">ANNOUNCED</div>
@@ -676,11 +725,8 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
             after a reload gets the DC its client-side state lost. */}
         <p className="sub">
           <span className="typechip dcchip">DC{' '}
-            <input aria-label="ritual DC" style={{ width: '3.5rem' }} defaultValue={overlay.dcVal ?? ''}
-              onChange={(e) => {
-                const v = parseInt(e.target.value, 10);
-                setOverlay({ ...overlay, dcVal: Number.isFinite(v) ? v : null });
-              }} />
+            <input aria-label="ritual DC" style={{ width: '3.5rem' }} value={dcInput}
+              onChange={(e) => setDcInput(e.target.value)} />
           </span>
         </p>
         <div className="modifier-actions" style={{ justifyContent: 'center', flexWrap: 'wrap' }}>
@@ -694,13 +740,15 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
           </span>
           {manualEditing
             ? <span className="typechip"><span className="keycap">m</span>
-                <input autoFocus aria-label="ritual manual modifier" defaultValue={pendingModifier?.kind === 'manual' ? pendingModifier.value : ''}
+                <input autoFocus aria-label="ritual manual modifier" value={manualInput}
+                  onChange={(e) => setManualInput(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
                       e.preventDefault(); e.stopPropagation();
-                      const raw = (e.target as HTMLInputElement).value.trim(); const value = Number(raw);
-                      if (raw !== '' && Number.isInteger(value)) { setPendingModifier({ kind: 'manual', value }); setManualEditing(false); }
-                      else say('manual modifier must be an integer');
+                      if (manualValue !== null && manualInput.trim() !== '') {
+                        setPendingModifier({ kind: 'manual', value: manualValue });
+                        setManualEditing(false);
+                      } else say('manual modifier must be an integer');
                     }
                     if (e.key === 'Escape') { e.stopPropagation(); setManualEditing(false); }
                   }} />
@@ -719,7 +767,7 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
         </p>
         <div className="actions">
           <button className="btn primary" disabled={!confirmed} onClick={reveal}>Reveal — Enter</button>
-          <button className="btn rubric" onClick={() => setOverlay({ mode: 'void', slot: overlay.slot, announceSeq: overlay.announceSeq })}>Void — v</button>
+          <button className="btn rubric" onClick={enterVoid}>Void — v</button>
         </div>
         <p className="sub faint">The announcement is public. Only reveal or void can follow it.</p>
       </div>
@@ -727,28 +775,36 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
   );
 }
 
-function VoidSheet({ overlay, push, say, refresh, close, slotName, clearPending }: any) {
+function VoidSheet({ overlay, setOverlay, push, say, refresh, slotName, clearPending }: any) {
   const [reason, setReason] = useState('');
+  const back = () => setOverlay(overlay.announced);
   const doVoid = async () => {
     try {
-      await api('/api/void', { announce_seq: overlay.announceSeq, reason: reason || 'abandoned' });
+      await api('/api/void', { announce_seq: overlay.announced.announceSeq, reason: reason || 'abandoned' });
       push({ who: slotName, desc: `VOID — ${reason || 'abandoned'}`, kind: 'void' });
       // await before closing: the recovery effect reads open_announce, and a
       // stale read would resurrect ANNOUNCED for the ritual just voided
       await refresh();
       clearPending();
-      close();
-    } catch (e: any) { say(e.message); close(); }
+      setOverlay(null);
+    } catch (e: any) {
+      say(e.message);
+      try {
+        const next = await refresh();
+        if (next.open_announce?.seq === overlay.announced.announceSeq) back();
+        else { clearPending(); setOverlay(null); }
+      } catch { back(); }
+    }
   };
   return (
-    <div className="overlay" onKeyDown={(e) => { if (e.key === 'Escape') close(); }}>
+    <div className="overlay" onKeyDown={(e) => { if (e.key === 'Escape') back(); }}>
       <div className="ceremony">
         <div className="word">VOID</div>
         <p className="sub">This writes a public void the table will see. The reserved position stays unconsumed.</p>
         <input type="text" autoFocus placeholder="why (public)" value={reason} onChange={(e) => setReason(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') void doVoid(); }} />
         <div className="actions">
-          <button className="btn ghost" onClick={close}>back</button>
+          <button className="btn ghost" onClick={back}>back</button>
           <button className="btn rubric" onClick={doVoid}>Write the void</button>
         </div>
       </div>
@@ -760,21 +816,60 @@ function CorrectSheet({ log, table, push, say, refresh, close }: any) {
   const last = log.find((l: LogLine) => l.kind === 'draw' && l.seq !== undefined);
   const [reason, setReason] = useState('drew on the wrong slot');
   const [redraw, setRedraw] = useState<string>('');
-  const players = table.slots.filter((s: SlotInfo) => s.active && !s.retired);
+  const [profile, setProfile] = useState('');
+  const [manual, setManual] = useState('');
+  const [replacementSeq, setReplacementSeq] = useState<number | null>(null);
+  const [drawStarted, setDrawStarted] = useState(false);
+  const [working, setWorking] = useState(false);
+  const replacementDrawId = useRef(uuid());
+  const type = last?.checkType ? table.registry.find((t: CheckType) => t.id === last.checkType) : null;
+  const targets = type ? table.slots.filter((s: SlotInfo) => s.active && !s.retired
+    && type.roles.includes(s.role ?? '') && s.lanes.includes(type.lane)) : [];
+  const target = targets.find((s: SlotInfo) => s.id === redraw);
+  const profiles: Record<string, number> = target
+    ? (target.role === 'player' ? table.sheets : table.npc_sheets)[target.id] ?? {} : {};
+  const manualValue = integerText(manual);
+  const choiceValid = profile !== '' && Number.isInteger(profiles[profile])
+    || manual.trim() !== '' && manualValue !== null;
   if (!last) return <div className="overlay" onClick={close}><div className="dialog"><p>No draw in this session's log to correct.</p></div></div>;
   const submit = async () => {
+    if (redraw && !choiceValid) { say('explicitly choose a profile or enter an integer manual modifier'); return; }
+    setWorking(true);
+    let attemptedReplacement = replacementSeq ?? undefined;
     try {
-      let replacement: number | undefined;
-      if (redraw) {
-        const typeId = last.desc.split(' ·')[0];
-        const res = await api('/api/draw', { draw_id: uuid(), slot: redraw, check_type: typeId, ...(last.dcVal !== undefined ? { dc: last.dcVal } : {}) });
-        replacement = res.entry.seq;
-        push({ seq: res.entry.seq, who: table.slots.find((s: SlotInfo) => s.id === redraw)?.display ?? redraw, lane: res.entry.lane, position: res.entry.position, desc: `${typeId} · redraw`, roll: res.roll, mod: res.modifier, dcVal: last.dcVal, kind: 'draw' });
+      if (redraw && attemptedReplacement === undefined) {
+        const typeId = last.checkType!;
+        setDrawStarted(true);
+        const res = await api('/api/draw', {
+          draw_id: replacementDrawId.current, slot: redraw, check_type: typeId,
+          ...(last.dcVal !== undefined ? { dc: last.dcVal } : {}),
+          ...(profile ? { profile } : { modifier: manualValue }),
+        });
+        const replacement = res.entry.seq as number;
+        attemptedReplacement = replacement;
+        setReplacementSeq(replacement);
+        if (!res.replay) push({ seq: res.entry.seq, who: target?.display ?? redraw, lane: res.entry.lane, position: res.entry.position, desc: `${typeId} · redraw`, checkType: typeId, roll: res.roll, mod: res.modifier, dcVal: last.dcVal, kind: 'draw' });
       }
-      await api('/api/correction', { target_seq: last.seq, reason, ...(replacement !== undefined ? { replacement_seq: replacement } : {}) });
+      await api('/api/correction', { target_seq: last.seq, reason, ...(attemptedReplacement !== undefined ? { replacement_seq: attemptedReplacement } : {}) });
       push({ who: last.who, desc: `corrected seq ${last.seq} — the value stays burned`, kind: 'void' });
-      refresh(); close();
-    } catch (e: any) { say(e.message); close(); }
+      await refresh(); close();
+    } catch (e: any) {
+      try {
+        const ledger = await api<{ entries: any[] }>('/api/ledger');
+        const landed = ledger.entries.find((entry) => entry.kind === 'correction'
+          && entry.target_seq === last.seq
+          && (attemptedReplacement === undefined || entry.replacement_seq === attemptedReplacement));
+        if (landed) {
+          push({ who: last.who, desc: `corrected seq ${last.seq} — the value stays burned`, kind: 'void' });
+          await refresh(); close(); return;
+        }
+      } catch { /* retain the retryable dialog */ }
+      if (attemptedReplacement === undefined && Number.isInteger(e?.status)) {
+        setDrawStarted(false);
+        replacementDrawId.current = uuid();
+      }
+      say(e.message);
+    } finally { setWorking(false); }
   };
   return (
     <div className="overlay" onKeyDown={(e) => { if (e.key === 'Escape') close(); }}>
@@ -784,14 +879,27 @@ function CorrectSheet({ log, table, push, say, refresh, close }: any) {
         <div className="row"><label className="fld">reason (public)<input type="text" autoFocus value={reason} onChange={(e) => setReason(e.target.value)} /></label></div>
         <div className="row">
           <span className="dim">redraw correctly on:</span>
-          <select value={redraw} onChange={(e) => setRedraw(e.target.value)}>
+          <select disabled={type?.ritual || drawStarted} value={redraw} onChange={(e) => { setRedraw(e.target.value); setProfile(''); setManual(''); }}>
             <option value="">— no redraw —</option>
-            {players.map((p: SlotInfo) => <option key={p.id} value={p.id}>{p.display ?? p.id}</option>)}
+            {targets.map((p: SlotInfo) => <option key={p.id} value={p.id}>{p.display ?? p.id}</option>)}
           </select>
         </div>
+        {type?.ritual && <p className="rubric">Ritual corrections need a fresh announcement; this dialog can only mark the original draw.</p>}
+        {redraw && <div className="row">
+          <label className="fld">profile
+            <select aria-label="correction profile" disabled={drawStarted} value={profile} onChange={(e) => { setProfile(e.target.value); setManual(''); }}>
+              <option value="">— explicitly choose —</option>
+              {Object.keys(profiles).sort().map((name) => <option key={name} value={name}>{name} {profiles[name] >= 0 ? '+' : ''}{profiles[name]}</option>)}
+            </select>
+          </label>
+          <label className="fld">or manual modifier
+            <input aria-label="correction manual modifier" disabled={drawStarted} value={manual}
+              onChange={(e) => { setManual(e.target.value); setProfile(''); }} />
+          </label>
+        </div>}
         <footer>
           <button className="btn ghost" onClick={close}>cancel</button>
-          <button className="btn rubric" onClick={submit}>Write correction</button>
+          <button className="btn rubric" disabled={working || !!redraw && !choiceValid} onClick={submit}>{replacementSeq === null ? 'Write correction' : 'Retry correction'}</button>
         </footer>
       </div>
     </div>
@@ -804,15 +912,18 @@ function CloseSession({ status, close, say, refresh }: any) {
   const [digest, setDigest] = useState<string | null>(null);
   const [dcInputs, setDcInputs] = useState<Record<number, string>>({});
   const [working, setWorking] = useState(false);
+  const recovery = !!status.close_pending && !status.session_open;
+  const targetSession = recovery ? status.close_pending_session : status.session;
 
   useEffect(() => {
+    if (recovery) { setDcless([]); return; }
     (async () => {
       const ledger = await api('/api/ledger');
       const lates = new Set(ledger.entries.filter((e: any) => e.kind === 'dc-late').map((e: any) => e.target_seq));
       setDcless(ledger.entries.filter((e: any) =>
         e.kind === 'draw' && e.session === status.session && !('dc' in e) && !('dc_commit' in e) && !lates.has(e.seq)));
     })();
-  }, [status.session]);
+  }, [status.session, recovery]);
 
   const sealDc = async (seq: number) => {
     const raw = (dcInputs[seq] ?? '').trim();
@@ -827,7 +938,6 @@ function CloseSession({ status, close, say, refresh }: any) {
   };
 
   const closeAndPublish = async () => {
-    if (!status.session_open) { say('no session is open'); close(); return; }
     if (dcless === null) return say('still checking for missing DCs');
     const supplied: { seq: number; dc: number }[] = [];
     for (const entry of dcless) {
@@ -839,23 +949,10 @@ function CloseSession({ status, close, say, refresh }: any) {
     }
     setWorking(true);
     try {
-      // Filled rows are a promise to save, not disposable form state. Commit
-      // them before closing; blank rows are the explicit "leave DC-less"
-      // choice. Each successful row disappears even if a later request fails.
-      for (const item of supplied) {
-        await api('/api/dc-late', { target_seq: item.seq, dc: item.dc });
-        setDcless((d) => d!.filter((entry) => entry.seq !== item.seq));
-      }
-      await api('/api/session/close', {});
-      // nightly open-lane disclosure through the current position (§4.3)
-      const t = await api('/api/table');
-      for (const [key, lane] of Object.entries<any>(t.lanes)) {
-        if (key.endsWith('/open') && lane.drawn > lane.watermark) {
-          const [slot, laneName] = key.split('/');
-          await api('/api/disclose', { slot, lane: laneName, through_position: lane.drawn });
-        }
-      }
-      const pub = await api('/api/publish', {});
+      const pub = await api('/api/session/close-and-publish', {
+        session: targetSession,
+        late_dcs: supplied.map((item) => ({ target_seq: item.seq, dc: item.dc })),
+      });
       const witness = pub.mirror === 'ok'
         ? 'mirror command succeeded — confirm the remote commit and post this head'
         : pub.mirror?.startsWith('failed')
@@ -871,11 +968,13 @@ function CloseSession({ status, close, say, refresh }: any) {
   return (
     <div className="overlay" onKeyDown={(e) => { if (e.key === 'Escape') close(); }}>
       <div className="dialog">
-        <h2>Close session {status.session} &amp; publish</h2>
+        <h2>{recovery ? `Recover publication for session ${targetSession}` : `Close session ${status.session} & publish`}</h2>
         {stage === 'review' && (
           <>
-            <p className="dim">Draws still missing a DC — seal them now or leave them DC-less forever:</p>
-            {dcless === null ? <p className="faint">checking…</p> : dcless.length === 0
+            {recovery
+              ? <p className="dim">The session is already durably closed. Retry only the frozen export and mirror ceremony; no ledger values can be changed.</p>
+              : <p className="dim">Draws still missing a DC — seal them now or leave them DC-less forever:</p>}
+            {!recovery && (dcless === null ? <p className="faint">checking…</p> : dcless.length === 0
               ? <p className="open-c">Every draw this session has its DC.</p>
               : dcless.map((e) => (
                 <div className="row" key={e.seq}>
@@ -885,10 +984,10 @@ function CloseSession({ status, close, say, refresh }: any) {
                     onChange={(ev) => setDcInputs((d) => ({ ...d, [e.seq]: ev.target.value }))} />
                   <button className="btn" disabled={working} onClick={() => sealDc(e.seq)}>seal DC</button>
                 </div>
-              ))}
+              )))}
             <footer>
               <button className="btn ghost" disabled={working} onClick={close}>not yet</button>
-              <button className="btn primary" disabled={dcless === null || working} onClick={closeAndPublish}>Close, disclose open lanes, publish</button>
+              <button className="btn primary" disabled={dcless === null || working || !Number.isInteger(targetSession)} onClick={closeAndPublish}>{recovery ? 'Retry publication' : 'Close, disclose open lanes, publish'}</button>
             </footer>
           </>
         )}

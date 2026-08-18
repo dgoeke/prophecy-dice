@@ -287,6 +287,7 @@ FORBIDDEN_PROFILE_NAMES = {
 
 def valid_profile_name(value) -> bool:
     return isinstance(value, str) \
+        and unicodedata.normalize("NFC", value) == value \
         and value == value.strip(PROFILE_TRIM_CHARS) \
         and 1 <= len(value) <= 64 \
         and PROFILE_CONTROL_RE.search(value) is None \
@@ -450,8 +451,9 @@ def modifier_cross_checks(entries: list, slots: dict, opened: dict) -> dict:
               and e.get("kind") == "sheet-update" and _is_int(e.get("seq"))
               and isinstance(e.get("slot"), str) and _valid_date(e.get("effective_from"))
               and isinstance(e.get("modifiers"), dict)]
-    sheet_slots = {e["slot"] for e in sheets}
-
+    sheets_by_slot: dict[str, list[dict]] = {}
+    for sheet in sheets:
+        sheets_by_slot.setdefault(sheet["slot"], []).append(sheet)
     for draw in entries:
         if not isinstance(draw, dict) or draw.get("kind") != "draw" \
                 or not _is_int(draw.get("seq")) or not isinstance(draw.get("slot"), str) \
@@ -461,12 +463,17 @@ def modifier_cross_checks(entries: list, slots: dict, opened: dict) -> dict:
         modifier = draw.get("modifier") if _is_int(draw.get("modifier")) \
             else opened_values.get("modifier") if _is_int(opened_values.get("modifier")) else None
         date = draw.get("ts", "")[:10] if isinstance(draw.get("ts"), str) else ""
-        applicable = [sheet for sheet in sheets if sheet["slot"] == draw["slot"]
-                      and sheet["seq"] < draw["seq"] and sheet["effective_from"] <= date]
-        applicable.sort(key=lambda sheet: (sheet["effective_from"], sheet["seq"]))
-        sheet = applicable[-1] if applicable else None
+        sheet = max(
+            (candidate for candidate in sheets_by_slot.get(draw["slot"], [])
+             if candidate["seq"] < draw["seq"] and candidate["effective_from"] <= date),
+            key=lambda candidate: (candidate["effective_from"], candidate["seq"]),
+            default=None,
+        )
         st = _dget(slots, draw["slot"], {}) or {}
-        is_player = st.get("role") == "player" or draw["slot"] in sheet_slots
+        is_player = st.get("role") == "player" or st.get("role_class") == "player"
+        is_private = st.get("role") in ("npc", "world") \
+            or st.get("role_class") == "non-player"
+        is_role_sealed = st.get("role") is None and st.get("role_class") is None
 
         if isinstance(draw.get("context"), str):
             parsed = parse_mod_directive(draw["context"])
@@ -482,7 +489,11 @@ def modifier_cross_checks(entries: list, slots: dict, opened: dict) -> dict:
         attribution = parsed["kind"]
         profile = parsed.get("name")
         sheet_modifier = None
-        if attribution == "sealed":
+        if is_private:
+            status = "private"
+        elif is_role_sealed:
+            status = "role_sealed"
+        elif attribution == "sealed":
             status = "sealed"
         elif attribution == "manual":
             status = "manual_override"
@@ -617,6 +628,9 @@ def verify_ledger(file) -> dict:
         # raises); seq stays raw so failure messages quote what the ledger said
         pos = _int_or(pos)
         if commits:
+            w = watermark.get(k, 0)
+            if pos <= w and _dget(entries[seq] if _is_int(seq) and 0 <= seq < len(entries) else {}, "kind") == "dc-late":
+                fail(f"inv 22: seq {seq} concerns {k} position {pos} already disclosed through {w}")
             carriers.setdefault(k, []).append({"seq": seq, "pos": pos, "commits": commits})
 
     def exact_keys(obj, expected: list[str], where: str) -> bool:
@@ -654,6 +668,13 @@ def verify_ledger(file) -> dict:
         # role is sealed for activated slots — rechecked after final reveal
         if st["role"] is not None and st["role"] not in type_["roles"]:
             fail(f"inv 10: seq {e['seq']} slot role {st['role']} not in roles "
+                 f"of check_type {e['check_type']}")
+        elif st.get("role_class") == "player" and "player" not in type_["roles"]:
+            fail(f"inv 10: seq {e['seq']} slot role player not in roles "
+                 f"of check_type {e['check_type']}")
+        elif st.get("role_class") == "non-player" \
+                and "npc" not in type_["roles"] and "world" not in type_["roles"]:
+            fail(f"inv 10: seq {e['seq']} slot role non-player not in roles "
                  f"of check_type {e['check_type']}")
         return type_
 
@@ -792,7 +813,9 @@ def verify_ledger(file) -> dict:
                                    for lane in s["lanes"]):
                         fail(f"structure: genesis active slot {s['id']} malformed")
                         continue
-                    slots[s["id"]] = {"role": s["role"], "lanes": set(s["lanes"]),
+                    slots[s["id"]] = {"role": s["role"],
+                                      "role_class": "player" if s["role"] == "player" else "non-player",
+                                      "lanes": set(s["lanes"]),
                                       "active": True, "retired": False, "A": None}
                     for lane in s["lanes"]:
                         tail = _dget(_asdict(_dget(_asdict(e.get("tails")), _key(s["id"]))), _key(lane))
@@ -807,7 +830,7 @@ def verify_ledger(file) -> dict:
                     if not fields_ok or any(s.get(k) is not None
                                             for k in ("role", "display", "lanes", "nonce")):
                         fail(f"structure: genesis deferred slot {s['id']} is not empty")
-                    slots[s["id"]] = {"role": None, "lanes": None,
+                    slots[s["id"]] = {"role": None, "role_class": None, "lanes": None,
                                       "active": False, "retired": False, "A": None}
                     deferred_queue.append(s["id"])
             active_slots = [s for s in transcript_slots
@@ -846,9 +869,11 @@ def verify_ledger(file) -> dict:
             st = _dget(slots, e.get("slot"))
             if st is None or not st["active"] or st["retired"]:
                 fail(f"structure: seq {e['seq']} sheet-update for non-player slot {e['slot']}")
-            elif st["role"] is None:
+            elif st.get("role_class") == "non-player":
+                fail(f"structure: seq {e['seq']} sheet-update for non-player slot {e['slot']}")
+            elif st["role"] is None and st.get("role_class") is None:
                 pending_sheet_updates.append({"seq": e["seq"], "slot": e["slot"]})
-            elif st["role"] != "player":
+            elif st["role"] is not None and st["role"] != "player":
                 fail(f"structure: seq {e['seq']} sheet-update for non-player slot {e['slot']}")
             modifiers = e.get("modifiers")
             if not _valid_date(e.get("effective_from")) or not isinstance(modifiers, dict) \
@@ -881,6 +906,9 @@ def verify_ledger(file) -> dict:
             reservation = cursor.get(k, 0) + 1
             if reservation > chain_len:
                 fail(f"structure: seq {e['seq']} reservation exceeds chain_length")
+            w = watermark.get(k, 0)
+            if reservation <= w:
+                fail(f"inv 22: seq {e['seq']} concerns {k} position {reservation} already disclosed through {w}")
             bump(k, reservation)
             open_announces[_key(e["seq"])] = {
                 "slot": e["slot"], "lane": e["lane"],
@@ -939,6 +967,9 @@ def verify_ledger(file) -> dict:
                 fail(f"inv 7: seq {e['seq']} {e['slot']}/{e['lane']} "
                      f"position {e['position']}, expected {want}")
             pos = _int_or(e["position"])  # placeholder keeps state arithmetic safe
+            w = watermark.get(k, 0)
+            if _is_int(e["position"]) and e["position"] <= w:
+                fail(f"inv 22: seq {e['seq']} concerns {k} position {e['position']} already disclosed through {w}")
             cursor[k] = pos
             bump(k, pos)
             draws_by_lane.setdefault(k, []).append({"seq": e["seq"], "pos": pos})
@@ -1032,8 +1063,10 @@ def verify_ledger(file) -> dict:
 
         elif kind == "activation-declare":
             d = e["declaration"]
+            activation_fields = ["version", "slot", "lanes", "label_commit", "nonce",
+                                 "declared_at", "beacon"]
             fields_ok = exact_keys(
-                d, ["version", "slot", "lanes", "label_commit", "nonce", "declared_at", "beacon"],
+                d, activation_fields + (["role_class"] if isinstance(d, dict) and "role_class" in d else []),
                 f"seq {e['seq']} activation declaration")
             beacon_ok = isinstance(d, dict) and exact_keys(
                 d.get("beacon"), ["chain", "round", "genesis_time", "period"],
@@ -1047,6 +1080,7 @@ def verify_ledger(file) -> dict:
                     or not isinstance(d.get("nonce"), str) or not d["nonce"] \
                     or not isinstance(d.get("label_commit"), str) \
                     or not HEX64_RE.match(d["label_commit"]) \
+                    or ("role_class" in d and d["role_class"] not in ("player", "non-player")) \
                     or not isinstance(d.get("beacon"), dict) \
                     or not isinstance(d["beacon"].get("chain"), str) \
                     or not _is_int(d["beacon"].get("round")) or d["beacon"]["round"] < 1 \
@@ -1064,8 +1098,12 @@ def verify_ledger(file) -> dict:
             if not isinstance(rec, dict) or not isinstance(rec.get("slot"), str):
                 fail(f"structure: seq {e['seq']} malformed activation_record")
                 continue
-            exact_keys(rec, ["version", "slot", "lanes", "label_commit", "nonce",
-                             "declared_at", "beacon"], f"seq {e['seq']} activation_record")
+            activation_fields = ["version", "slot", "lanes", "label_commit", "nonce",
+                                 "declared_at", "beacon"]
+            exact_keys(rec, activation_fields + (["role_class"] if "role_class" in rec else []),
+                       f"seq {e['seq']} activation_record")
+            if "role_class" in rec and rec["role_class"] not in ("player", "non-player"):
+                fail(f"structure: seq {e['seq']} malformed activation_record")
             exact_keys(rec.get("beacon"), ["chain", "round", "genesis_time", "period",
                                           "randomness"], f"seq {e['seq']} activation beacon")
             expected = deferred_queue[activated_count] if activated_count < len(deferred_queue) else None
@@ -1124,6 +1162,7 @@ def verify_ledger(file) -> dict:
                 if sorted(_asdict(e.get("tails")).keys()) != sorted(lanes or []):
                     fail(f"structure: seq {e['seq']} activation tails do not match declared lanes")
                 st["active"] = True
+                st["role_class"] = rec.get("role_class")
                 st["lanes"] = set(rec.get("lanes", []))
                 try:
                     st["A"] = sha256(canonical_bytes(rec))
@@ -1167,6 +1206,14 @@ def verify_ledger(file) -> dict:
             if t > mc:
                 fail(f"inv 22: seq {e['seq']} through_position {t} "
                      f"exceeds highest concerned position {mc}")
+            consumed = cursor.get(k, 0)
+            if t > consumed:
+                next_seq = e["seq"] + 1
+                while next_seq < len(entries) and entries[next_seq].get("kind") == "disclose":
+                    next_seq += 1
+                if next_seq >= len(entries) or entries[next_seq].get("kind") != "final-reveal":
+                    fail(f"inv 22: seq {e['seq']} through_position {t} exceeds highest "
+                         f"consumed position {consumed} outside final reveal")
             # one forward walk serves the tail check (inv 21), commitment
             # recomputation (inv 24), and derived rolls (inv 23) — O(t)
             chain_ok = False
@@ -1247,6 +1294,15 @@ def verify_ledger(file) -> dict:
                 fail(f"structure: seq {e['seq']} second final-reveal")
             else:
                 final_reveal = e
+            for k, mc in max_concerned.items():
+                w = watermark.get(k, 0)
+                if w != mc:
+                    fail(f"inv 25: final-reveal leaves {k} disclosed through {w}, expected {mc}")
+            for lane_carriers in carriers.values():
+                for carrier in lane_carriers:
+                    if carrier["seq"] < e["seq"] and _key(carrier["seq"]) not in opened_seqs:
+                        fail(f"inv 25: final-reveal leaves commitment at seq "
+                             f"{carrier['seq']} unopened")
 
         elif kind == "closed":
             if not isinstance(e.get("reason"), str) or not e["reason"].strip():
@@ -1317,9 +1373,13 @@ def verify_ledger(file) -> dict:
                 if not ok:
                     fail(f"inv 25: label for {l['slot']} does not recompute")
                 else:
+                    expected_class = "player" if l["role"] == "player" else "non-player"
+                    if rec.get("role_class") is not None and rec["role_class"] != expected_class:
+                        fail(f"inv 25: label for {l['slot']} role does not match activation role_class")
                     st = _dget(slots, l.get("slot"))
                     if st is not None:
                         st["role"] = l["role"]
+                        st["role_class"] = expected_class
                     for seq, d in draw_records.items():
                         if d["slot"] != l["slot"]:
                             continue

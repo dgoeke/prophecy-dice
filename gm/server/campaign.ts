@@ -25,7 +25,9 @@ import { canonicalBytes } from '../core/canonical.ts';
 import * as C from '../core/crypto.ts';
 import { entryHash, ZERO64, LEDGER_FORMAT } from '../core/ledger.ts';
 import { KNOWN_CHAINS, verifyLedger } from '../core/verify.ts';
-import { validProfileName } from '../core/profile.ts';
+import {
+  applicableSheet, hasModDirective, SheetSnapshot, validDate, validProfileName,
+} from '../core/profile.ts';
 import {
   atomicWrite, decryptJson, DEFAULT_KDF, deriveKey, encryptJson, Kdf, KdfHeader,
   newKdfHeader, rotateBackup,
@@ -41,6 +43,32 @@ const validRequestId = (v: unknown): v is string =>
   && !Object.prototype.hasOwnProperty.call(Object.prototype, v);
 
 interface SealedValues { dc?: number; modifier?: number; context?: string }
+interface PublicationResult {
+  session: number;
+  close_seq: number | null;
+  head: string;
+  digest: string;
+  mirror: string | null;
+  replay: boolean;
+}
+interface CloseReceipt {
+  session: number;
+  close_seq: number;
+  from_seq: number;
+  through_seq: number;
+  head: string;
+  digest: string;
+  late_dcs: Record<string, number>;
+  state: 'pending' | 'complete';
+  mirror: string | null;
+}
+interface PendingPublication {
+  session: number;
+  from_seq: number;
+  through_seq: number;
+  head: string;
+  digest: string;
+}
 interface Priv {
   secret: string;                                   // hex 64
   precommit_at: string;                             // RFC 3339
@@ -51,10 +79,16 @@ interface Priv {
   labels: Record<string, { display: string; role: string }>; // sealed activation labels
   npc_sheets: Record<string, Record<string, number>>;
   profile_defaults: Record<string, Record<string, string>>;
+  pending_profile_save?: {
+    slot: string; defaults: Record<string, string>; sheet_seq: number;
+  } | null;
   draw_ids: Record<string, number>;                 // transport-level, never in ledger (§6.5)
   batch_ids: Record<string, number[]>;
   pending: (PendingActivation & { declared_at: string }) | null;
   last_published_seq: number;
+  close_receipts?: Record<string, CloseReceipt>;
+  last_publication?: PublicationResult | null;
+  pending_publication?: PendingPublication | null;
   ui_state: unknown;
 }
 interface PendingActivation {
@@ -63,6 +97,7 @@ interface PendingActivation {
 }
 interface SlotState {
   role: string | null; display: string | null; lanes: Set<string>;
+  roleClass: 'player' | 'non-player' | null;
   active: boolean; retired: boolean; A: Buffer | null;
 }
 interface PlannedDraw {
@@ -105,6 +140,7 @@ export class Campaign {
   private openedSeqs = new Set<number>();
   private slots = new Map<string, SlotState>();
   private registry = new Map<string, any>();
+  private playerSheets = new Map<string, SheetSnapshot[]>();
   private deferredQueue: string[] = [];
   private activatedCount = 0;
   private openAnnounce: {
@@ -114,6 +150,7 @@ export class Campaign {
   private E: Buffer | null = null;
   private session = 0;
   private sessionOpen_ = false;
+  private lastSessionCloseSeq = -1;
   private lastTs = '';
   private finalRevealed = false;
   private closed = false;
@@ -132,10 +169,13 @@ export class Campaign {
     return 'empty';
   }
   status() {
+    const closePendingSession = this.closePendingSession();
     return {
       phase: this.phase, locked: this.locked, rehearsal: !!this.opts.rehearsal,
       campaign: this.transcript?.campaign ?? null, session: this.session,
       session_open: this.sessionOpen_,
+      close_pending: closePendingSession !== null,
+      close_pending_session: closePendingSession,
       entries: this.entries.length,
       unpublished: this.locked ? null : this.entries.length - 1 - (this.priv?.last_published_seq ?? -1),
       pending_activation: this.locked ? null : this.priv?.pending
@@ -216,7 +256,8 @@ export class Campaign {
         secret: S.toString('hex'), precommit_at: this.ts(), rehearsal: !!this.opts.rehearsal,
         configuration_commitment: null, configuration: null,
         values: {}, labels: {}, npc_sheets: {}, profile_defaults: {}, draw_ids: {}, batch_ids: {},
-        pending: null, last_published_seq: -1, ui_state: null,
+        pending: null, pending_profile_save: null, last_published_seq: -1,
+        close_receipts: {}, last_publication: null, pending_publication: null, ui_state: null,
       };
       this.locked = false;
       this.writePrivate();
@@ -386,20 +427,8 @@ export class Campaign {
       // snapshots; the World profile stays private like every non-player map.
       for (const slot of slots) {
         if (slot.status !== 'active' || !['player', 'world'].includes(slot.role)) continue;
-        this.priv!.profile_defaults[slot.id] = Object.fromEntries(
-          transcript.check_types
-            .filter((type: any) => type.roles.includes(slot.role) && slot.lanes.includes(type.lane))
-            .map((type: any) => [type.id, 'Default']),
-        );
-        if (slot.role === 'player') {
-          this.append({
-            kind: 'sheet-update', slot: slot.id,
-            effective_from: transcript.created_at.slice(0, 10),
-            modifiers: { Default: 0 },
-          });
-        } else {
-          this.priv!.npc_sheets[slot.id] = { Default: 0 };
-        }
+        this.bootstrapSlotProfiles(slot.id, slot.role, slot.lanes,
+          transcript.created_at.slice(0, 10), transcript.check_types);
       }
       this.writePrivate();
       this.writeLedger();
@@ -497,6 +526,10 @@ export class Campaign {
     const N = this.transcript.chain_length;
     const position = (this.cursor.get(key) ?? 0) + 1;
     if (position > N) err(`lane ${key} is exhausted (N=${N}); no extension protocol exists`, 409);
+    const disclosedThrough = this.watermark.get(key) ?? 0;
+    if (position <= disclosedThrough) {
+      err(`position ${position} of ${key} was already disclosed through ${disclosedThrough}`, 409);
+    }
     if (position > N * 0.8) console.warn(`[column] warning: ${key} at ${position}/${N} (>80%)`);
     const p = C.preimageAt(links, position);
     const seq = plan.seq;
@@ -508,11 +541,12 @@ export class Campaign {
     const hasProfile = req.profile !== undefined;
     const hasManual = req.modifier !== undefined;
     if (hasProfile && hasManual) err('profile and modifier are mutually exclusive');
-    if (hasProfile && !validProfileName(req.profile)) err('invalid profile name');
+    const requestedProfile = typeof req.profile === 'string' ? req.profile.normalize('NFC') : req.profile;
+    if (hasProfile && !validProfileName(requestedProfile)) err('invalid profile name');
     if (hasManual && !Number.isInteger(req.modifier)) err('modifier must be an integer');
     const profile: string | undefined = hasManual
       ? undefined
-      : hasProfile ? req.profile : this.priv!.profile_defaults[req.slot]?.[req.check_type];
+      : hasProfile ? requestedProfile : this.priv!.profile_defaults[req.slot]?.[req.check_type];
     if (!hasManual && !validProfileName(profile)) {
       err(`no modifier recorded for ${req.slot}/${req.check_type} — set it on /sheets, or press m at the table`);
     }
@@ -534,7 +568,7 @@ export class Campaign {
     }
     const contextBase = req.context ?? type.label;
     if (typeof contextBase !== 'string') err('context must be a string');
-    if (this.hasModDirective(contextBase)) err('context must not contain an @mod directive');
+    if (hasModDirective(contextBase)) err('context must not contain an @mod directive');
     const context = `${contextBase.trimEnd()}\n@mod ${hasManual ? 'manual' : JSON.stringify(profile)}`;
     if (this.transcript.context_privacy === 'sealed') entry.context_commit = C.contextCommit(p, seq, context);
     else entry.context = context;
@@ -582,10 +616,6 @@ export class Campaign {
     if (Object.keys(vals).length) this.priv!.values[built.seq] = vals;
   }
 
-  private hasModDirective(context: string): boolean {
-    return context.split(/\r\n|[\r\n\u2028\u2029]/).some((line) => /^@mod(?:\s|$)/u.test(line));
-  }
-
   // ---- announces (§5.3, §7.3.4) --------------------------------------------
   async announce(req: { slot: string; check_type: string; context?: string; initiator?: string }) {
     return this.mutate(() => {
@@ -605,12 +635,16 @@ export class Campaign {
       const links = this.links.get(key) ?? err(`no chain for ${key}`);
       const reservation = (this.cursor.get(key) ?? 0) + 1;
       if (reservation > this.transcript.chain_length) err(`lane ${key} is exhausted`, 409);
+      const disclosedThrough = this.watermark.get(key) ?? 0;
+      if (reservation <= disclosedThrough) {
+        err(`position ${reservation} of ${key} was already disclosed through ${disclosedThrough}`, 409);
+      }
       const p = C.preimageAt(links, reservation);
       const seq = this.entries.length;
       const entry: any = { kind: 'announce', slot: req.slot, lane: type.lane, check_type: req.check_type, initiator };
       const context = req.context ?? type.label;
       if (typeof context !== 'string') err('context must be a string');
-      if (this.hasModDirective(context)) err('context must not contain an @mod directive');
+      if (hasModDirective(context)) err('context must not contain an @mod directive');
       if (this.transcript.context_privacy === 'sealed') entry.context_commit = C.contextCommit(p, seq, context);
       else entry.context = context;
       const built = this.append(entry);
@@ -642,6 +676,7 @@ export class Campaign {
   async correction(req: { target_seq: number; reason: string; replacement_seq?: number }) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       const t = this.entries[req.target_seq];
       if (!t || t.kind !== 'draw') err('correction target must be a draw');
       if (this.entries.some((e) => e.kind === 'correction' && e.target_seq === req.target_seq)) err('draw already corrected');
@@ -662,22 +697,7 @@ export class Campaign {
   async dcLate(req: { target_seq: number; dc: number }) {
     return this.mutate(() => {
       this.requireLive();
-      if (!this.sessionOpen_) err('dc-late requires an open session');
-      const t = this.entries[req.target_seq];
-      if (!t || t.kind !== 'draw') err('dc-late target must be a draw');
-      if (t.session !== this.session) err('dc-late must land in the same session as its draw');
-      if ('dc' in t || 'dc_commit' in t) err('target already has a DC');
-      if (this.entries.some((e) => e.kind === 'dc-late' && e.target_seq === req.target_seq)) err('target already has a dc-late');
-      if (!Number.isInteger(req.dc)) err('dc must be an integer');
-      const type = this.registry.get(t.check_type)!;
-      const links = this.links.get(`${t.slot}/${t.lane}`)!;
-      const p = C.preimageAt(links, t.position);
-      const seq = this.entries.length;
-      const e: any = { kind: 'dc-late', target_seq: req.target_seq };
-      if (type.seal_dc) e.dc_commit = C.dcCommit(p, seq, req.dc);
-      else e.dc = req.dc;
-      const built = this.append(e);
-      if ('dc_commit' in built) this.priv!.values[built.seq] = { dc: req.dc };
+      const built = this.appendDcLate(req.target_seq, req.dc);
       this.writePrivate(); this.writeLedger();
       return built;
     });
@@ -686,6 +706,7 @@ export class Campaign {
   async outOfBand(req: { check_type: string; slot?: string; result: number; reason: string }) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (!this.registry.has(req.check_type)) err(`unknown check_type ${req.check_type}`);
       if (!Number.isInteger(req.result) || req.result < 1 || req.result > 20) err('result must be 1..20');
       if (typeof req.reason !== 'string' || !req.reason.trim()) err('out-of-band reason is required');
@@ -701,28 +722,21 @@ export class Campaign {
   async sheetUpdate(req: { slot: string; effective_from?: string; modifiers: Record<string, number> }) {
     return this.mutate(() => {
       this.requireLive();
-      if (!req.modifiers || typeof req.modifiers !== 'object' || Array.isArray(req.modifiers)
-          || Object.entries(req.modifiers).some(([name, v]) => !validProfileName(name) || !Number.isInteger(v))) {
-        err('modifiers must map valid profile names to integers');
-      }
+      this.requireNoPublicationPending();
+      const modifiers = this.normalizeModifiers(req.modifiers);
       const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
       if (!st.active || st.retired) err(`slot ${req.slot} is not active`);
       const role = st.role ?? this.priv!.labels[req.slot]?.role;
       if (role === 'player') {
-        if (typeof req.effective_from !== 'string'
-            || !/^\d{4}-\d{2}-\d{2}$/.test(req.effective_from)
-            || !Number.isFinite(Date.parse(`${req.effective_from}T00:00:00Z`))
-            || new Date(`${req.effective_from}T00:00:00Z`).toISOString().slice(0, 10) !== req.effective_from) {
-          err('effective_from must be a real YYYY-MM-DD date');
-        }
-        const built = this.append({ kind: 'sheet-update', slot: req.slot, effective_from: req.effective_from, modifiers: req.modifiers });
+        if (!validDate(req.effective_from)) err('effective_from must be a real YYYY-MM-DD date');
+        const built = this.append({ kind: 'sheet-update', slot: req.slot, effective_from: req.effective_from, modifiers });
         this.writePrivate(); this.writeLedger();
         return { entry: built, private: false };
       }
       if ('effective_from' in req) err('effective_from is only valid for player sheets');
       // NPC/world sheets stay private; modifiers actually used in draws are
       // committed per draw and open through disclosure/final reveal (§7.5).
-      this.priv!.npc_sheets[req.slot] = { ...req.modifiers };
+      this.priv!.npc_sheets[req.slot] = { ...modifiers };
       this.writePrivate();
       return { entry: null, private: true };
     });
@@ -731,28 +745,98 @@ export class Campaign {
   async profileDefaults(req: { slot: string; defaults: Record<string, string> }) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
       if (!st.active || st.retired) err(`slot ${req.slot} is not active`);
       const role = st.role ?? this.priv!.labels[req.slot]?.role ?? err(`no role known for ${req.slot}`);
-      if (!req.defaults || typeof req.defaults !== 'object' || Array.isArray(req.defaults)) {
-        err('defaults must map check types to profile names');
-      }
-      for (const [checkType, profile] of Object.entries(req.defaults)) {
-        const type = this.registry.get(checkType);
-        if (!type || !type.roles.includes(role) || !st.lanes.has(type.lane)) {
-          err(`check_type ${checkType} is not available to ${req.slot}`);
-        }
-        if (!validProfileName(profile)) err(`invalid profile name for ${checkType}`);
-      }
-      this.priv!.profile_defaults[req.slot] = { ...req.defaults };
+      const defaults = this.normalizeDefaults(req.defaults);
+      const profiles = role === 'player'
+        ? this.applicablePlayerSheet(req.slot, this.entries.length,
+          new Date(this.now()).toISOString().slice(0, 10))?.modifiers ?? {}
+        : this.priv!.npc_sheets[req.slot] ?? {};
+      this.validateDefaults(req.slot, role, st.lanes, defaults, profiles);
+      this.priv!.profile_defaults[req.slot] = { ...defaults };
       this.writePrivate();
       return { defaults: this.priv!.profile_defaults[req.slot] };
+    });
+  }
+
+  /** One validated mutation for the /sheets editor: no dangling intermediate defaults. */
+  async saveProfiles(req: {
+    slot: string; defaults?: Record<string, string>;
+    modifiers?: Record<string, number>; effective_from?: string;
+  }) {
+    return this.mutate(() => {
+      this.requireLive();
+      this.requireNoPublicationPending();
+      const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
+      if (!st.active || st.retired) err(`slot ${req.slot} is not active`);
+      const role = st.role ?? this.priv!.labels[req.slot]?.role ?? err(`no role known for ${req.slot}`);
+      const today = new Date(this.now()).toISOString().slice(0, 10);
+      const defaults = this.normalizeDefaults(
+        req.defaults ?? this.priv!.profile_defaults[req.slot] ?? {},
+      );
+      let profiles: Record<string, number>;
+      let modifiers: Record<string, number> | undefined;
+      if (req.modifiers !== undefined) {
+        modifiers = this.normalizeModifiers(req.modifiers);
+        if (role === 'player' && Object.keys(modifiers).length === 0) {
+          err('a public profile snapshot cannot be empty');
+        }
+        if (role === 'player') {
+          if (!validDate(req.effective_from)) err('effective_from must be a real YYYY-MM-DD date');
+          const candidate: SheetSnapshot = {
+            seq: this.entries.length, slot: req.slot,
+            effective_from: req.effective_from!, modifiers,
+          };
+          profiles = applicableSheet(
+            [...(this.playerSheets.get(req.slot) ?? []), candidate],
+            req.slot, candidate.seq + 1, today,
+          )?.modifiers ?? {};
+        } else {
+          if ('effective_from' in req) err('effective_from is only valid for player sheets');
+          profiles = modifiers;
+        }
+      } else {
+        if ('effective_from' in req) err('effective_from requires a profile snapshot');
+        profiles = role === 'player'
+          ? this.applicablePlayerSheet(req.slot, this.entries.length, today)?.modifiers ?? {}
+          : this.priv!.npc_sheets[req.slot] ?? {};
+      }
+      this.validateDefaults(req.slot, role, st.lanes, defaults, profiles);
+
+      let entry: any = null;
+      if (modifiers !== undefined) {
+        if (role === 'player') {
+          entry = this.append({
+            kind: 'sheet-update', slot: req.slot,
+            effective_from: req.effective_from, modifiers,
+          });
+        } else {
+          this.priv!.npc_sheets[req.slot] = { ...modifiers };
+        }
+      }
+      if (entry) {
+        // Two-phase recovery across the encrypted/private and public files.
+        // If the process dies before the ledger write, load drops the intent;
+        // if it dies after, load completes the matching defaults update.
+        this.priv!.pending_profile_save = {
+          slot: req.slot, defaults: { ...defaults }, sheet_seq: entry.seq,
+        };
+        this.writePrivate();
+        this.writeLedger();
+      }
+      this.priv!.profile_defaults[req.slot] = { ...defaults };
+      this.priv!.pending_profile_save = null;
+      this.writePrivate();
+      return { entry, private: role !== 'player', defaults: { ...defaults } };
     });
   }
 
   async retireSlot(req: { slot: string; reason: string }) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
       if (!st.active || st.retired) err(`slot ${req.slot} not active`);
       if (typeof req.reason !== 'string' || !req.reason.trim()) err('retirement reason is required');
@@ -766,6 +850,7 @@ export class Campaign {
   async sessionOpen() {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (this.sessionOpen_) err('a session is already open');
       this.session += 1;
       this.sessionOpen_ = true;
@@ -777,6 +862,7 @@ export class Campaign {
   async sessionClose() {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (!this.sessionOpen_) err('no session is open');
       if (this.openAnnounce) err('resolve the open announce before closing the session');
       this.sessionOpen_ = false;
@@ -785,9 +871,114 @@ export class Campaign {
       return built;
     });
   }
+
+  /**
+   * The complete §4.3 ceremony in one serialized server operation. Retrying
+   * after a lost response is safe: recorded late DCs and the frozen ledger
+   * head are checked, then the persisted receipt is returned unchanged.
+   */
+  async closeAndPublish(req: { session: number; late_dcs: { target_seq: number; dc: number }[] }): Promise<PublicationResult> {
+    return this.mutate(() => this.closeAndPublishLocked(req));
+  }
+
+  /** Close/recover while already holding the mutation queue. */
+  private closeAndPublishLocked(req: { session: number; late_dcs: { target_seq: number; dc: number }[] }): PublicationResult {
+    this.requireLive();
+    this.requirePublishAllowed();
+    if (!Number.isInteger(req.session) || req.session < 1) err('session must be a positive integer');
+    const lateDcs = req.late_dcs;
+    if (!Array.isArray(lateDcs)
+        || new Set(lateDcs.map((item) => item?.target_seq)).size !== lateDcs.length) {
+      err('late_dcs must contain distinct draw targets');
+    }
+    for (const item of lateDcs) {
+      if (!item || !Number.isInteger(item.target_seq) || !Number.isInteger(item.dc)) {
+        err('late_dcs must contain integer target_seq and dc values');
+      }
+    }
+
+    this.priv!.close_receipts ??= {};
+    const receiptKey = String(req.session);
+    let receipt = this.priv!.close_receipts[receiptKey];
+    if (receipt) {
+      for (const item of lateDcs) {
+        if (receipt.late_dcs[String(item.target_seq)] !== item.dc) {
+          err(`session ${req.session} was already closed with a different DC for #${item.target_seq}`, 409);
+        }
+      }
+      if (receipt.state === 'complete') return this.receiptResult(receipt, true);
+      const frozen = this.entries[receipt.through_seq];
+      if (!frozen || frozen.hash !== receipt.head || this.entries.length - 1 !== receipt.through_seq) {
+        err(`pending publication receipt for session ${req.session} no longer matches the ledger`, 500);
+      }
+    } else {
+      if (req.session !== this.session) {
+        err(`close request is for session ${req.session}, current session is ${this.session}`, 409);
+      }
+      const pendingSession = this.closePendingSession();
+      if (!this.sessionOpen_ && pendingSession !== req.session) {
+        err(`session ${req.session} is not open and has no pending publication`, 409);
+      }
+      const fromSeq = this.priv!.last_published_seq + 1;
+      if (this.sessionOpen_) {
+        if (this.openAnnounce) err('resolve the open announce before closing the session');
+        for (const item of lateDcs) this.appendDcLate(item.target_seq, item.dc);
+        this.sessionOpen_ = false;
+        this.append({ kind: 'session-close' });
+      } else {
+        // Recovery after session-close/disclosure persisted but export failed.
+        for (const item of lateDcs) {
+          const existing = this.entries.find((entry) =>
+            entry.kind === 'dc-late' && entry.target_seq === item.target_seq);
+          if (!existing || this.dcLateValueFor(item.target_seq) !== item.dc) {
+            err(`session is closed and DC for #${item.target_seq} was not recorded`, 409);
+          }
+        }
+      }
+      this.ensureOpenLaneDisclosures();
+      const throughSeq = this.entries.length - 1;
+      const closeSeq = this.lastSessionCloseSeq;
+      const head = this.entries[throughSeq].hash;
+      const recordedLateDcs = Object.fromEntries(this.entries
+        .filter((entry) => entry.kind === 'dc-late' && entry.session === req.session)
+        .map((entry) => [String(entry.target_seq), this.dcLateValueFor(entry.target_seq)!]));
+      receipt = {
+        session: req.session, close_seq: closeSeq, from_seq: fromSeq, through_seq: throughSeq,
+        head, digest: this.digestForSession(req.session, head), late_dcs: recordedLateDcs,
+        state: 'pending', mirror: null,
+      };
+      this.priv!.close_receipts[receiptKey] = receipt;
+      this.writePrivate();
+      this.writeLedger();
+    }
+
+    atomicWrite(join(this.opts.publicDir, 'ledger.json'), this.ledgerText(), 0o644);
+    const previousPublishedSeq = this.priv!.last_published_seq;
+    const previousPublication = this.priv!.last_publication;
+    const mirror = this.runMirror(receipt.head);
+    const result = this.receiptResult({ ...receipt, state: 'complete', mirror }, false);
+    this.priv!.last_published_seq = receipt.through_seq;
+    receipt.state = 'complete';
+    receipt.mirror = mirror;
+    this.priv!.last_publication = result;
+    try {
+      this.writePrivate();
+    } catch (error) {
+      // Keep the live process consistent with the pending receipt already on
+      // disk. A retry may rerun an externally successful mirror, using head
+      // as its idempotency key, but must never silently treat it as complete.
+      this.priv!.last_published_seq = previousPublishedSeq;
+      this.priv!.last_publication = previousPublication;
+      receipt.state = 'pending';
+      receipt.mirror = null;
+      throw error;
+    }
+    return result;
+  }
   async note(text: string) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (typeof text !== 'string' || !text.trim()) err('note text is required');
       const built = this.append({ kind: 'note', text });
       this.writePrivate(); this.writeLedger();
@@ -801,6 +992,7 @@ export class Campaign {
     const round = await beacon.declare(600);
     const declared = await this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (this.sessionOpen_) err('activate slots between sessions, not while a session is open');
       if (this.priv!.pending) err('an activation is already pending');
       const expected = this.deferredQueue[this.activatedCount] ?? err('no deferred slots left', 409);
@@ -826,8 +1018,14 @@ export class Campaign {
         err('beacon provider returned parameters that do not match the known chain', 502);
       }
       const S = Buffer.from(this.priv!.secret, 'hex');
+      // The declaration must be the final entry until `activate`, so finish
+      // any previous session's missing open-lane disclosure before appending
+      // it. The immediate witness publication below can then never trip the
+      // adjacency guard or publish an incomplete prior close.
+      this.ensureOpenLaneDisclosures();
       const declaration = {
         version: 'wotw-column/1', slot: expected, lanes: req.lanes,
+        role_class: req.role === 'player' ? 'player' : 'non-player',
         label_commit: C.labelCommit(C.labelSalt(S, this.E!, expected), req.display.trim(), req.role),
         nonce: req.nonce, declared_at: this.ts(), beacon: round,
       };
@@ -862,6 +1060,7 @@ export class Campaign {
     if (!/^[0-9a-f]{64}$/.test(randomness)) err('beacon returned malformed randomness', 502);
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       const live = this.priv!.pending;
       if (!live || live.declaration_seq !== pend.declaration_seq) err('pending activation changed while fetching beacon', 409);
       const S = Buffer.from(this.priv!.secret, 'hex');
@@ -878,8 +1077,14 @@ export class Campaign {
         tails[lane] = links[N].toString('hex');
       }
       const built = this.append({ kind: 'activate', activation_record: record, tails });
-      this.slots.set(pend.slot, { role: null, display: null, lanes: new Set(pend.lanes), active: true, retired: false, A });
+      this.slots.set(pend.slot, {
+        role: null, roleClass: record.role_class ?? null, display: null,
+        lanes: new Set(pend.lanes), active: true, retired: false, A,
+      });
       this.priv!.labels[pend.slot] = { display: pend.display, role: pend.role };
+      if (pend.role === 'player' || pend.role === 'world') {
+        this.bootstrapSlotProfiles(pend.slot, pend.role, pend.lanes, built.ts.slice(0, 10));
+      }
       this.priv!.pending = null;
       this.activatedCount += 1;
       this.writePrivate(); this.writeLedger();
@@ -889,13 +1094,22 @@ export class Campaign {
 
   // ---- disclosure (§4.4, §7.6) ---------------------------------------------
   disclosePreview(slot: string, lane: string, through: number) {
+    return this.disclosePreviewInternal(slot, lane, through, false);
+  }
+
+  private disclosePreviewInternal(slot: string, lane: string, through: number, allowTrailingReservation: boolean) {
     this.requireLive();
     if (!Number.isInteger(through)) err('through_position must be an integer');
     const key = `${slot}/${lane}`;
     const links = this.links.get(key) ?? err(`no chain for ${key}`);
     const w = this.watermark.get(key) ?? 0;
     if (through <= w) err(`through_position ${through} must exceed watermark ${w}`);
-    if (through > (this.maxConcerned.get(key) ?? 0)) err(`through_position ${through} exceeds highest concerned position`);
+    const limit = allowTrailingReservation
+      ? (this.maxConcerned.get(key) ?? 0)
+      : (this.cursor.get(key) ?? 0);
+    if (through > limit) {
+      err(`through_position ${through} exceeds highest ${allowTrailingReservation ? 'concerned' : 'consumed'} position ${limit}`);
+    }
     const opened: any[] = [];
     const draws: any[] = [];
     for (const e of this.entries) {
@@ -925,6 +1139,9 @@ export class Campaign {
 
   async disclose(req: { slot: string; lane: string; through_position: number }) {
     return this.mutate(() => {
+      this.requireLive();
+      this.requireNoPublicationPending();
+      if (this.sessionOpen_) err('disclosure requires a closed session', 409);
       const pv = this.disclosePreview(req.slot, req.lane, req.through_position);
       const key = `${req.slot}/${req.lane}`;
       const links = this.links.get(key)!;
@@ -944,6 +1161,7 @@ export class Campaign {
   async revealAll(scope: string) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (typeof scope !== 'string' || !scope.trim()) err('reveal-all scope is required');
       const built = this.append({ kind: 'reveal-all', scope });
       this.writePrivate(); this.writeLedger(); // if this throws, nothing is shown
@@ -962,6 +1180,7 @@ export class Campaign {
   async finalReveal() {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (this.finalRevealed) err('already revealed', 409);
       if (this.sessionOpen_) err('close the current session before final reveal');
       if (this.priv!.pending) err('complete the pending activation before final reveal');
@@ -973,7 +1192,7 @@ export class Campaign {
       for (const k of lanes) {
         const [slot, lane] = k.split('/');
         const through = this.maxConcerned.get(k)!;
-        const pv = this.disclosePreview(slot, lane, through);
+        const pv = this.disclosePreviewInternal(slot, lane, through, true);
         const links = this.links.get(k)!;
         this.append({
           kind: 'disclose', slot, lane, through_position: through,
@@ -994,6 +1213,7 @@ export class Campaign {
   async close(reason: string) {
     return this.mutate(() => {
       this.requireLive();
+      this.requireNoPublicationPending();
       if (!this.finalRevealed) err('final-reveal is required before closing the ledger', 409);
       if (this.sessionOpen_) err('close the current session before closing the ledger');
       if (typeof reason !== 'string' || !reason.trim()) err('closing reason is required');
@@ -1005,46 +1225,19 @@ export class Campaign {
   }
 
   // ---- publish (§4.3, §7.7) -------------------------------------------------
-  async publish(): Promise<{ head: string; digest: string; mirror: string | null }> {
+  async publish(): Promise<PublicationResult> {
     return this.mutate(() => {
       this.requireLive();
-      // Rehearsal publishes into its own publicDir so the ceremony's final
-      // step, the session-close wizard, and the player verifier can all be
-      // exercised for real (§7.8). What it must never do is reach the
-      // players: a mirror command would push a throwaway campaign to the
-      // audience, so its presence is a hard configuration error here rather
-      // than something the GM must remember not to trigger.
-      if (this.opts.rehearsal && this.opts.mirrorCommand) {
-        err('rehearsal must not be configured with a git mirror: it would publish a throwaway campaign to the players', 409);
+      this.requirePublishAllowed();
+      const pending = this.closePendingSession();
+      if (pending !== null) {
+        return this.closeAndPublishLocked({ session: pending, late_dcs: [] });
       }
-      const from = this.priv!.last_published_seq + 1;
-      const fresh = this.entries.slice(from);
-      const draws = fresh.filter((e) => e.kind === 'draw');
-      const sealedCount = draws.filter((e) => e.lane !== 'open').length;
-      const digest = [
-        // a stray rehearsal digest must announce itself: the chat message is
-        // the one artifact that travels without its surrounding context
-        ...(this.opts.rehearsal ? ['REHEARSAL — throwaway campaign, do not post to the players'] : []),
-        `Session ${this.session} — ${draws.length} draws (${sealedCount} sealed, ${draws.length - sealedCount} open), `
-        + `${fresh.filter((e) => e.kind === 'void').length} voids, ${fresh.filter((e) => e.kind === 'correction').length} corrections`,
-        `head ${this.entries[this.entries.length - 1].hash}`,
-      ].join('\n');
-      // 0644: the published artifact is read by a separate web server (§6.6)
-      atomicWrite(join(this.opts.publicDir, 'ledger.json'), this.ledgerText(), 0o644);
-      this.priv!.last_published_seq = this.entries.length - 1;
-      this.writePrivate();
-      // §6.6: a configured command may push to an independent witness. We can
-      // report command success, not prove where it pushed or whether the
-      // remote resists rewrites. Failure never undoes the local publication.
-      let mirror: string | null = null;
-      if (this.opts.mirrorCommand) {
-        try {
-          execFileSync('/bin/sh', ['-c', this.opts.mirrorCommand],
-            { cwd: this.opts.publicDir, timeout: 60_000, stdio: 'pipe' });
-          mirror = 'ok';
-        } catch (e: any) { mirror = `failed: ${e.message}`; }
-      }
-      return { head: this.entries[this.entries.length - 1].hash, digest, mirror };
+      if (this.sessionOpen_) err('close the current session before publishing', 409);
+      if (this.openAnnounce) err('resolve the open announce before publishing', 409);
+      const disclosed = this.ensureOpenLaneDisclosures();
+      if (disclosed) { this.writePrivate(); this.writeLedger(); }
+      return this.publishNow();
     });
   }
 
@@ -1056,19 +1249,43 @@ export class Campaign {
     for (const [id, st] of this.slots) {
       for (const lane of st.lanes) {
         const k = `${id}/${lane}`;
-        if (!lanes[k]) lanes[k] = { drawn: 0, remaining: this.transcript.chain_length, watermark: 0 };
+        if (!lanes[k]) lanes[k] = {
+          drawn: 0, remaining: this.transcript.chain_length,
+          watermark: this.watermark.get(k) ?? 0,
+        };
       }
     }
     const sheets: any = {};
+    const latest_sheets: Record<string, SheetSnapshot> = {};
+    const scheduled_sheets: Record<string, SheetSnapshot[]> = {};
     const today = new Date(this.now()).toISOString().slice(0, 10);
     for (const [slot, st] of this.slots) {
       const role = st.role ?? this.priv!.labels[slot]?.role;
       if (role !== 'player') continue;
       const sheet = this.applicablePlayerSheet(slot, this.entries.length, today);
       if (sheet) sheets[slot] = { ...sheet.modifiers };
+      const latest = this.playerSheets.get(slot)?.at(-1);
+      if (latest) latest_sheets[slot] = {
+        seq: latest.seq, slot: latest.slot, effective_from: latest.effective_from,
+        modifiers: { ...latest.modifiers },
+      };
+      const futureByDate = new Map<string, SheetSnapshot>();
+      for (const candidate of this.playerSheets.get(slot) ?? []) {
+        if (candidate.effective_from <= today) continue;
+        const existing = futureByDate.get(candidate.effective_from);
+        if (!existing || candidate.seq > existing.seq) futureByDate.set(candidate.effective_from, candidate);
+      }
+      const scheduled = [...futureByDate.values()]
+        .sort((a, b) => a.effective_from.localeCompare(b.effective_from) || a.seq - b.seq)
+        .map((candidate) => ({
+          seq: candidate.seq, slot: candidate.slot, effective_from: candidate.effective_from,
+          modifiers: { ...candidate.modifiers },
+        }));
+      if (scheduled.length) scheduled_sheets[slot] = scheduled;
     }
     return {
-      session: this.session, lanes, sheets, npc_sheets: this.priv!.npc_sheets,
+      session: this.session, lanes, sheets, latest_sheets, scheduled_sheets,
+      npc_sheets: this.priv!.npc_sheets,
       profile_defaults: this.priv!.profile_defaults,
       // enough for /table to rebuild the ANNOUNCED state after a reload or a
       // failed reveal: an announcement is public and can only be resolved by
@@ -1153,6 +1370,68 @@ export class Campaign {
   private requireUnlocked() { if (this.locked || !this.priv) err('locked', 423); }
   private requireLive() { this.requireUnlocked(); if (this.phase !== 'live') err('no genesis yet', 409); }
 
+  private closePendingSession(): number | null {
+    if (!this.priv || this.lastSessionCloseSeq <= this.priv.last_published_seq) return null;
+    const closed = this.entries[this.lastSessionCloseSeq];
+    return Number.isInteger(closed?.session) ? closed.session : this.session;
+  }
+
+  private requireNoPublicationPending(): void {
+    const pending = this.closePendingSession();
+    if (pending !== null) err(`finish publishing session ${pending} before changing the ledger`, 409);
+    if (this.priv?.pending_publication) {
+      err(`finish publishing head ${this.priv.pending_publication.head} before changing the ledger`, 409);
+    }
+  }
+
+  private normalizeModifiers(modifiers: unknown): Record<string, number> {
+    if (!modifiers || typeof modifiers !== 'object' || Array.isArray(modifiers)) {
+      err('modifiers must map valid profile names to integers');
+    }
+    const normalized: Record<string, number> = {};
+    for (const [rawName, value] of Object.entries(modifiers)) {
+      const name = rawName.normalize('NFC');
+      if (!validProfileName(name) || !Number.isInteger(value)) {
+        err('modifiers must map valid profile names to integers');
+      }
+      if (Object.prototype.hasOwnProperty.call(normalized, name)) {
+        err(`profile names collide after NFC normalization: ${JSON.stringify(name)}`);
+      }
+      normalized[name] = value as number;
+    }
+    return normalized;
+  }
+
+  private normalizeDefaults(defaults: unknown): Record<string, string> {
+    if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
+      err('defaults must map check types to profile names');
+    }
+    return Object.fromEntries(Object.entries(defaults).map(([checkType, profile]) => {
+      if (typeof profile !== 'string') err(`invalid profile name for ${checkType}`);
+      return [checkType, profile.normalize('NFC')];
+    }));
+  }
+
+  private validateDefaults(
+    slot: string, role: string, lanes: Set<string>, defaults: unknown,
+    profiles: Record<string, number>,
+  ): asserts defaults is Record<string, string> {
+    if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
+      err('defaults must map check types to profile names');
+    }
+    for (const [checkType, profile] of Object.entries(defaults)) {
+      const type = this.registry.get(checkType);
+      if (!type || !type.roles.includes(role) || !lanes.has(type.lane)) {
+        err(`check_type ${checkType} is not available to ${slot}`);
+      }
+      if (!validProfileName(profile)) err(`invalid profile name for ${checkType}`);
+      if (!Object.prototype.hasOwnProperty.call(profiles, profile)
+          || !Number.isInteger(profiles[profile])) {
+        err(`profile ${JSON.stringify(profile)} for ${checkType} is not available to ${slot}`);
+      }
+    }
+  }
+
   private ts(): string {
     const t = new Date(this.now()).toISOString().replace(/\.\d{3}Z$/, 'Z');
     return t >= this.lastTs ? t : this.lastTs;
@@ -1176,7 +1455,30 @@ export class Campaign {
     entry.hash = entryHash(entry);
     this.lastTs = entry.ts;
     this.entries.push(entry);
+    if (entry.kind === 'session-close') this.lastSessionCloseSeq = entry.seq;
+    if (entry.kind === 'sheet-update') {
+      const slotSheets = this.playerSheets.get(entry.slot) ?? [];
+      slotSheets.push(entry as SheetSnapshot);
+      this.playerSheets.set(entry.slot, slotSheets);
+    }
     return entry;
+  }
+
+  private bootstrapSlotProfiles(
+    slot: string, role: string, lanes: Iterable<string>, effectiveFrom: string,
+    checkTypes: any[] = [...this.registry.values()],
+  ): void {
+    const laneSet = lanes instanceof Set ? lanes : new Set(lanes);
+    this.priv!.profile_defaults[slot] = Object.fromEntries(
+      checkTypes
+        .filter((type: any) => type.roles.includes(role) && laneSet.has(type.lane))
+        .map((type: any) => [type.id, 'Default']),
+    );
+    if (role === 'player') {
+      this.append({ kind: 'sheet-update', slot, effective_from: effectiveFrom, modifiers: { Default: 0 } });
+    } else {
+      this.priv!.npc_sheets[slot] = { Default: 0 };
+    }
   }
 
   /**
@@ -1247,6 +1549,150 @@ export class Campaign {
     atomicWrite(this.path('private.enc'), encryptJson(this.priv, this.key, this.kdfHeader));
   }
 
+  private appendDcLate(targetSeq: number, dc: number): any {
+    if (!this.sessionOpen_) err('dc-late requires an open session');
+    const target = this.entries[targetSeq];
+    if (!target || target.kind !== 'draw') err('dc-late target must be a draw');
+    if (target.session !== this.session) err('dc-late must land in the same session as its draw');
+    if ('dc' in target || 'dc_commit' in target) err('target already has a DC');
+    if (this.entries.some((entry) => entry.kind === 'dc-late' && entry.target_seq === targetSeq)) {
+      err('target already has a dc-late');
+    }
+    if (!Number.isInteger(dc)) err('dc must be an integer');
+    const type = this.registry.get(target.check_type)!;
+    const links = this.links.get(`${target.slot}/${target.lane}`)!;
+    const preimage = C.preimageAt(links, target.position);
+    const seq = this.entries.length;
+    const entry: any = { kind: 'dc-late', target_seq: targetSeq };
+    if (type.seal_dc) {
+      const key = `${target.slot}/${target.lane}`;
+      const disclosedThrough = this.watermark.get(key) ?? 0;
+      if (target.position <= disclosedThrough) {
+        err(`position ${target.position} of ${key} was already disclosed through ${disclosedThrough}`, 409);
+      }
+      entry.dc_commit = C.dcCommit(preimage, seq, dc);
+    }
+    else entry.dc = dc;
+    const built = this.append(entry);
+    if ('dc_commit' in built) this.priv!.values[built.seq] = { dc };
+    return built;
+  }
+
+  /** Append every missing disclosure for consumed positions in public `open` lanes. */
+  private ensureOpenLaneDisclosures(): number {
+    let count = 0;
+    for (const key of [...this.maxConcerned.keys()].sort()) {
+      const [slot, lane] = key.split('/');
+      if (lane !== 'open') continue;
+      const through = this.cursor.get(key) ?? 0;
+      if (through <= (this.watermark.get(key) ?? 0)) continue;
+      const preview = this.disclosePreview(slot, lane, through);
+      const links = this.links.get(key)!;
+      this.append({
+        kind: 'disclose', slot, lane, through_position: through,
+        preimage: C.preimageAt(links, through).toString('hex'), opened: preview.opened,
+      });
+      for (const opened of preview.opened) this.openedSeqs.add(opened.seq);
+      this.watermark.set(key, through);
+      count++;
+    }
+    return count;
+  }
+
+  private requirePublishAllowed(): void {
+    // Rehearsal publishes locally, but can never reach the players' mirror.
+    if (this.opts.rehearsal && this.opts.mirrorCommand) {
+      err('rehearsal must not be configured with a git mirror: it would publish a throwaway campaign to the players', 409);
+    }
+  }
+
+  private digestForSession(session: number, head: string): string {
+    const sessionEntries = this.entries.filter((entry) => entry.session === session);
+    const draws = sessionEntries.filter((entry) => entry.kind === 'draw');
+    const sealedCount = draws.filter((entry) => entry.lane !== 'open').length;
+    return [
+      ...(this.opts.rehearsal ? ['REHEARSAL — throwaway campaign, do not post to the players'] : []),
+      `Session ${session} — ${draws.length} draws (${sealedCount} sealed, ${draws.length - sealedCount} open), `
+      + `${sessionEntries.filter((entry) => entry.kind === 'void').length} voids, ${sessionEntries.filter((entry) => entry.kind === 'correction').length} corrections`,
+      `head ${head}`,
+    ].join('\n');
+  }
+
+  private receiptResult(receipt: CloseReceipt, replay: boolean): PublicationResult {
+    return {
+      session: receipt.session, close_seq: receipt.close_seq, head: receipt.head,
+      digest: receipt.digest, mirror: receipt.mirror, replay,
+    };
+  }
+
+  private runMirror(head: string): string | null {
+    if (!this.opts.mirrorCommand) return null;
+    try {
+      execFileSync('/bin/sh', ['-c', this.opts.mirrorCommand],
+        {
+          cwd: this.opts.publicDir, timeout: 60_000, stdio: 'pipe',
+          env: { ...process.env, COLUMN_PUBLISH_HEAD: head },
+        });
+      return 'ok';
+    } catch (error: any) { return `failed: ${error.message}`; }
+  }
+
+  /** Publish while already holding the mutation queue. */
+  private publishNow(): PublicationResult {
+    let pending = this.priv!.pending_publication;
+    if (!pending) {
+      const from = this.priv!.last_published_seq + 1;
+      const head = this.entries.at(-1)?.hash;
+      if (from >= this.entries.length) {
+        const last = this.priv!.last_publication;
+        if (last && last.head === head) {
+          return { ...last, replay: true };
+        }
+        err('published position has no matching cached publication receipt', 500);
+      }
+      const fresh = this.entries.slice(from);
+      const draws = fresh.filter((entry) => entry.kind === 'draw');
+      const sealedCount = draws.filter((entry) => entry.lane !== 'open').length;
+      const digest = [
+        ...(this.opts.rehearsal ? ['REHEARSAL — throwaway campaign, do not post to the players'] : []),
+        `Session ${this.session} — ${draws.length} draws (${sealedCount} sealed, ${draws.length - sealedCount} open), `
+        + `${fresh.filter((entry) => entry.kind === 'void').length} voids, ${fresh.filter((entry) => entry.kind === 'correction').length} corrections`,
+        `head ${head}`,
+      ].join('\n');
+      pending = {
+        session: this.session, from_seq: from, through_seq: this.entries.length - 1,
+        head, digest,
+      };
+      this.priv!.pending_publication = pending;
+      this.writePrivate();
+    } else {
+      const frozen = this.entries[pending.through_seq];
+      if (!frozen || frozen.hash !== pending.head || pending.through_seq !== this.entries.length - 1) {
+        err('pending standalone publication no longer matches the ledger', 500);
+      }
+    }
+    atomicWrite(join(this.opts.publicDir, 'ledger.json'), this.ledgerText(), 0o644);
+    const mirror = this.runMirror(pending.head);
+    const result: PublicationResult = {
+      session: pending.session, close_seq: null, head: pending.head,
+      digest: pending.digest, mirror, replay: false,
+    };
+    const previousPublishedSeq = this.priv!.last_published_seq;
+    const previousPublication = this.priv!.last_publication;
+    this.priv!.last_published_seq = pending.through_seq;
+    this.priv!.last_publication = result;
+    this.priv!.pending_publication = null;
+    try {
+      this.writePrivate();
+    } catch (error) {
+      this.priv!.last_published_seq = previousPublishedSeq;
+      this.priv!.last_publication = previousPublication;
+      this.priv!.pending_publication = pending;
+      throw error;
+    }
+    return result;
+  }
+
   private deriveLane(slot: string, lane: string, A: Buffer | null): Buffer[] {
     const S = Buffer.from(this.priv!.secret, 'hex');
     const ikm = A ? C.ikmFor(S, this.E!, A) : C.ikmFor(S, this.E!);
@@ -1272,14 +1718,7 @@ export class Campaign {
     return late ? (late.dc ?? this.priv!.values[late.seq]?.dc) : undefined;
   }
   private applicablePlayerSheet(slot: string, beforeSeq: number, throughDate: string): any | undefined {
-    let best: any | undefined;
-    for (const e of this.entries) {
-      if (e.kind !== 'sheet-update' || e.slot !== slot || e.seq >= beforeSeq
-          || e.effective_from > throughDate) continue;
-      if (!best || e.effective_from > best.effective_from
-          || (e.effective_from === best.effective_from && e.seq > best.seq)) best = e;
-    }
-    return best;
+    return applicableSheet(this.playerSheets.get(slot) ?? [], slot, beforeSeq, throughDate);
   }
 
   private playerSheetMod(slot: string, profile: string, beforeSeq: number, throughDate: string): number | undefined {
@@ -1295,6 +1734,10 @@ export class Campaign {
   private load(): void {
     this.priv!.npc_sheets ??= {};
     this.priv!.profile_defaults ??= {};
+    this.priv!.pending_profile_save ??= null;
+    this.priv!.close_receipts ??= {};
+    this.priv!.last_publication ??= null;
+    this.priv!.pending_publication ??= null;
     // prune private orphans from a crash between private and ledger writes
     const text = existsSync(this.path('ledger.json')) ? readFileSync(this.path('ledger.json'), 'utf8') : null;
     if (text === null) { this.entries = []; return; }
@@ -1305,9 +1748,40 @@ export class Campaign {
     }
     this.entries = file.entries;
     const nEntries = this.entries.length;
+    // Private metadata is written before the corresponding ledger rename in
+    // several crash-safe append paths. If the ledger rename never happened,
+    // publication metadata may point one entry past the durable chain.
+    if (this.priv!.last_published_seq >= nEntries) {
+      this.priv!.last_published_seq = nEntries - 1;
+    }
+    if (this.priv!.last_publication
+        && this.entries[this.priv!.last_published_seq]?.hash !== this.priv!.last_publication.head) {
+      this.priv!.last_publication = null;
+    }
+    if (this.priv!.pending_profile_save) {
+      const pending = this.priv!.pending_profile_save;
+      const sheet = this.entries[pending.sheet_seq];
+      if (sheet?.kind === 'sheet-update' && sheet.slot === pending.slot) {
+        this.priv!.profile_defaults[pending.slot] = { ...pending.defaults };
+      }
+      this.priv!.pending_profile_save = null;
+    }
     for (const [id, s] of Object.entries(this.priv!.draw_ids)) if (s >= nEntries) delete this.priv!.draw_ids[id];
     for (const [id, ss] of Object.entries(this.priv!.batch_ids)) if (ss.some((s) => s >= nEntries)) delete this.priv!.batch_ids[id];
     for (const s of Object.keys(this.priv!.values)) if (Number(s) >= nEntries) delete this.priv!.values[s];
+    for (const [session, receipt] of Object.entries(this.priv!.close_receipts)) {
+      if (!receipt || receipt.session !== Number(session)
+          || this.entries[receipt.close_seq]?.kind !== 'session-close'
+          || this.entries[receipt.through_seq]?.hash !== receipt.head) {
+        delete this.priv!.close_receipts[session];
+      }
+    }
+    if (this.priv!.pending_publication) {
+      const pending = this.priv!.pending_publication;
+      if (this.entries[pending.through_seq]?.hash !== pending.head) {
+        throw new Error('pending standalone publication no longer matches the ledger');
+      }
+    }
     // reconcile the pending activation with the ledger. Two crash windows
     // exist between writePrivate and writeLedger:
     //  - declare crashed: priv has pending, ledger lacks the declaration →
@@ -1342,22 +1816,33 @@ export class Campaign {
     this.transcript = this.entries[0].transcript;
     this.E = C.genesisEntropy(this.transcript);
     if (this.transcript.commitment !== C.commitmentOf(S)) throw new Error('secret does not match ledger commitment; refusing to start');
-    this.registry.clear(); this.slots.clear(); this.links.clear();
+    this.registry.clear(); this.slots.clear(); this.links.clear(); this.playerSheets.clear();
     this.cursor.clear(); this.maxConcerned.clear(); this.watermark.clear(); this.openedSeqs.clear();
     this.deferredQueue = []; this.activatedCount = 0; this.openAnnounce = null;
-    this.session = 0; this.finalRevealed = false; this.closed = false;
+    this.session = 0; this.lastSessionCloseSeq = -1; this.finalRevealed = false; this.closed = false;
     this.lastTs = this.entries[nEntries - 1].ts;
     for (const t of this.transcript.check_types) this.registry.set(t.id, t);
     for (const s of this.transcript.slots) {
       if (s.status === 'active') {
-        this.slots.set(s.id, { role: s.role, display: s.display, lanes: new Set(s.lanes), active: true, retired: false, A: null });
+        this.slots.set(s.id, {
+          role: s.role, roleClass: s.role === 'player' ? 'player' : 'non-player',
+          display: s.display, lanes: new Set(s.lanes), active: true, retired: false, A: null,
+        });
         for (const lane of s.lanes) this.deriveLane(s.id, lane, null);
       } else this.deferredQueue.push(s.id);
     }
     this.sessionOpen_ = false;
     for (const e of this.entries) {
       if (e.kind === 'session-open') { this.session = e.session; this.sessionOpen_ = true; }
-      else if (e.kind === 'session-close') this.sessionOpen_ = false;
+      else if (e.kind === 'session-close') {
+        this.sessionOpen_ = false;
+        this.lastSessionCloseSeq = e.seq;
+      }
+      else if (e.kind === 'sheet-update') {
+        const slotSheets = this.playerSheets.get(e.slot) ?? [];
+        slotSheets.push(e as SheetSnapshot);
+        this.playerSheets.set(e.slot, slotSheets);
+      }
       else if (e.kind === 'draw') {
         const k = `${e.slot}/${e.lane}`;
         this.cursor.set(k, e.position);
@@ -1375,7 +1860,10 @@ export class Campaign {
       } else if (e.kind === 'activate') {
         const rec = e.activation_record;
         const A = C.sha256(canonicalBytes(rec));
-        this.slots.set(rec.slot, { role: null, display: null, lanes: new Set(rec.lanes), active: true, retired: false, A });
+        this.slots.set(rec.slot, {
+          role: null, roleClass: rec.role_class ?? null, display: null,
+          lanes: new Set(rec.lanes), active: true, retired: false, A,
+        });
         for (const lane of rec.lanes) this.deriveLane(rec.slot, lane, A);
         this.activatedCount += 1;
       } else if (e.kind === 'retire-slot') {

@@ -31,6 +31,14 @@ entropy is entered. The registry is immutable after genesis.
 
 ## Part 1 — Modifier profiles (the substantive change)
 
+Profile identifiers are NFC-normalized before duplicate detection and
+emission, then compared exactly and case-sensitively. A save validates its
+defaults against the hypothetical appended history under the same greatest
+`(effective_from, seq)` rule used by draws; a backdated snapshot therefore
+cannot validate a dangling current default. `/api/table.scheduled_sheets`
+lists every future transition, deduplicated by date at greatest sequence and
+sorted chronologically.
+
 ### Model
 
 - A **profile** is a named final bonus: `"Society": 5`, `"Perception": 7`,
@@ -552,6 +560,29 @@ newly generated disclosed ledger cross-checks correctly; gate passes.
    profiles and defaults through `/sheets`. Sheet-updates need a live
    campaign but not an open session, so this fits between genesis and the
    first `session-open`.
+
+### Rehearsal follow-up invariants
+
+Session close is a persisted three-state ceremony:
+`OPEN(n) → CLOSED_PENDING(n) → CLOSED_PUBLISHED(n)`. The close request names
+the session, and an encrypted frozen receipt makes response-loss retries
+return the original head, digest, count, and mirror result. No session or
+ledger mutation may begin while recovery is pending, and standalone publish
+is unavailable during play. Between-session standalone publication also
+persists its frozen range, head, and digest before export, so an interrupted
+retry cannot reuse a stale receipt or omit the mirror attempt.
+
+Ordinary disclosure stops at the consumed draw cursor. Only final reveal may
+extend through a trailing voided reservation; producers and all three
+verifiers reject a later carrier at or below a disclosure watermark. A final
+reveal is valid only after every lane reaches its highest concerned position
+and every earlier commitment carrier has been opened.
+
+Every new activation publishes only `role_class: player|non-player`. Exact
+NPC/world role and display remain sealed, while the class supports pre-reveal
+player sheet and check-type validation. Modifier reports use explicit
+`private` and `role_sealed` statuses instead of renderer-side role inference;
+legacy activations without `role_class` remain accepted.
 
 ## Acceptance criteria
 

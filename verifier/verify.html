@@ -304,7 +304,7 @@ const hasUnpairedSurrogate = value => [...value].some(character => {
   const code = character.charCodeAt(0);
   return character.length === 1 && code >= 0xd800 && code <= 0xdfff;
 });
-const validProfileName = v => typeof v === 'string' && v === v.trim()
+const validProfileName = v => typeof v === 'string' && v.normalize('NFC') === v && v === v.trim()
   && [...v].length >= 1 && [...v].length <= 64
   && !PROFILE_CONTROL_RE.test(v) && !hasUnpairedSurrogate(v) && !FORBIDDEN_PROFILE_NAMES.has(v);
 function parseModDirective(context) {
@@ -370,7 +370,12 @@ function modifierCrossChecks(entries, slots, opened) {
   const sheets = entries.filter(e => e?.kind === 'sheet-update' && isInt(e.seq)
     && typeof e.slot === 'string' && validDate(e.effective_from)
     && e.modifiers && typeof e.modifiers === 'object' && !Array.isArray(e.modifiers));
-  const sheetSlots = new Set(sheets.map(e => e.slot));
+  const sheetsBySlot = new Map();
+  for (const sheet of sheets) {
+    const slotSheets = sheetsBySlot.get(sheet.slot) ?? [];
+    slotSheets.push(sheet);
+    sheetsBySlot.set(sheet.slot, slotSheets);
+  }
   for (const draw of entries) {
     if (draw?.kind !== 'draw' || !isInt(draw.seq)
         || typeof draw.slot !== 'string' || typeof draw.check_type !== 'string') continue;
@@ -378,11 +383,16 @@ function modifierCrossChecks(entries, slots, opened) {
     const modifier = isInt(draw.modifier) ? draw.modifier
       : isInt(openedValues.modifier) ? openedValues.modifier : null;
     const date = typeof draw.ts === 'string' ? draw.ts.slice(0, 10) : '';
-    const applicable = sheets.filter(sheet => sheet.slot === draw.slot
-      && sheet.seq < draw.seq && sheet.effective_from <= date)
-      .sort((a, b) => a.effective_from < b.effective_from ? -1
-        : a.effective_from > b.effective_from ? 1 : a.seq - b.seq).at(-1);
-    const isPlayer = slots.get(draw.slot)?.role === 'player' || sheetSlots.has(draw.slot);
+    let applicable;
+    for (const sheet of sheetsBySlot.get(draw.slot) ?? []) {
+      if (sheet.seq >= draw.seq || sheet.effective_from > date) continue;
+      if (!applicable || sheet.effective_from > applicable.effective_from
+          || (sheet.effective_from === applicable.effective_from && sheet.seq > applicable.seq)) applicable = sheet;
+    }
+    const slot = slots.get(draw.slot);
+    const isPlayer = slot?.role === 'player' || slot?.roleClass === 'player';
+    const isPrivate = slot?.role === 'npc' || slot?.role === 'world' || slot?.roleClass === 'non-player';
+    const isRoleSealed = slot?.role == null && slot?.roleClass == null;
     let parsed;
     if (typeof draw.context === 'string') parsed = parseModDirective(draw.context);
     else if (typeof openedValues.context === 'string') parsed = parseModDirective(openedValues.context);
@@ -392,7 +402,9 @@ function modifierCrossChecks(entries, slots, opened) {
 
     const attribution = parsed.kind, profile = parsed.name ?? null;
     let sheetModifier = null, status;
-    if (attribution === 'sealed') status = 'sealed';
+    if (isPrivate) status = 'private';
+    else if (isRoleSealed) status = 'role_sealed';
+    else if (attribution === 'sealed') status = 'sealed';
     else if (attribution === 'manual') status = 'manual_override';
     else if (attribution === 'malformed') {
       status = 'malformed';
@@ -477,7 +489,12 @@ async function verifyLedger(file, progress) {
   const pendingSheetUpdates = [];
   const key = (s, l) => `${s}/${l}`;
   const bump = (m, k, v) => m.set(k, Math.max(m.get(k) ?? 0, v));
-  const addCarrier = (k, c) => { if (Object.keys(c.commits).length) (carriers.get(k) ?? carriers.set(k, []).get(k)).push(c); };
+  const addCarrier = (k, c) => {
+    if (!Object.keys(c.commits).length) return;
+    const w = watermark.get(k) ?? 0;
+    if (c.pos <= w && entries[c.seq]?.kind === 'dc-late') fail(`inv 22: seq ${c.seq} concerns ${k} position ${c.pos} already disclosed through ${w}`);
+    (carriers.get(k) ?? carriers.set(k, []).get(k)).push(c);
+  };
   const exactKeys = (obj, expected, where) => {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { fail(`structure: ${where} is not an object`); return false; }
     if (Object.keys(obj).sort().join() !== [...expected].sort().join()) {
@@ -495,6 +512,8 @@ async function verifyLedger(file, progress) {
     if (e.lane !== t.lane) fail(`inv 10: seq ${e.seq} lane ${e.lane} does not match check_type ${e.check_type} lane ${t.lane}`);
     if (st.lanes && !st.lanes.has(e.lane)) fail(`inv 10: seq ${e.seq} slot ${e.slot} does not declare lane ${e.lane}`);
     if (st.role !== null && !t.roles.includes(st.role)) fail(`inv 10: seq ${e.seq} slot role ${st.role} not in roles of check_type ${e.check_type}`);
+    else if (st.roleClass === 'player' && !t.roles.includes('player')) fail(`inv 10: seq ${e.seq} slot role player not in roles of check_type ${e.check_type}`);
+    else if (st.roleClass === 'non-player' && !t.roles.includes('npc') && !t.roles.includes('world')) fail(`inv 10: seq ${e.seq} slot role non-player not in roles of check_type ${e.check_type}`);
     return t;
   };
   const sealForms = (e, t) => {
@@ -574,7 +593,7 @@ async function verifyLedger(file, progress) {
               || new Set(s.lanes).size !== s.lanes.length || s.lanes.some(l => !LANE_RE.test(String(l)))) {
             fail(`structure: genesis active slot ${s.id} malformed`); continue;
           }
-          slots.set(s.id, { role: s.role, display: s.display, lanes: new Set(s.lanes), active: true, retired: false, A: null });
+          slots.set(s.id, { role: s.role, roleClass: s.role === 'player' ? 'player' : 'non-player', display: s.display, lanes: new Set(s.lanes), active: true, retired: false, A: null });
           for (const lane of s.lanes) {
             const tl = e.tails?.[s.id]?.[lane];
             if (typeof tl !== 'string' || !HEX64.test(tl)) fail(`structure: genesis missing tail for ${s.id}/${lane}`);
@@ -584,7 +603,7 @@ async function verifyLedger(file, progress) {
           const ok = exactKeys(s, ['id','display','role','status','lanes','nonce'], `genesis deferred slot ${s.id}`);
           if (!ok || s.role !== null || s.display !== null || s.lanes !== null || s.nonce !== null)
             fail(`structure: genesis deferred slot ${s.id} is not empty`);
-          slots.set(s.id, { role: null, display: null, lanes: null, active: false, retired: false, A: null }); deferredQ.push(s.id);
+          slots.set(s.id, { role: null, roleClass: null, display: null, lanes: null, active: false, retired: false, A: null }); deferredQ.push(s.id);
         }
       }
       // the tails object must cover exactly the active slots and their lanes
@@ -612,8 +631,9 @@ async function verifyLedger(file, progress) {
     } else if (e.kind === 'sheet-update') {
       const st = slots.get(e.slot);
       if (!st || !st.active || st.retired) fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
-      else if (st.role === null) pendingSheetUpdates.push({ seq: e.seq, slot: e.slot });
-      else if (st.role !== 'player') fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
+      else if (st.roleClass === 'non-player') fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
+      else if (st.role === null && st.roleClass === null) pendingSheetUpdates.push({ seq: e.seq, slot: e.slot });
+      else if (st.role !== null && st.role !== 'player') fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
       if (!validDate(e.effective_from) || !e.modifiers || typeof e.modifiers !== 'object'
           || Array.isArray(e.modifiers)
           || Object.entries(e.modifiers).some(([name,v]) => !validProfileName(name) || !isInt(v)))
@@ -635,6 +655,8 @@ async function verifyLedger(file, progress) {
       if ([...openAnns.values()].some(a => !a.resolved)) fail(`structure: seq ${e.seq} announce while another announce is unresolved`);
       const k = key(e.slot, e.lane), resv = (cursor.get(k) ?? 0) + 1;
       if (resv > chainLen) fail(`structure: seq ${e.seq} reservation exceeds chain_length`);
+      const w = watermark.get(k) ?? 0;
+      if (resv <= w) fail(`inv 22: seq ${e.seq} concerns ${k} position ${resv} already disclosed through ${w}`);
       bump(maxConc, k, resv);
       openAnns.set(e.seq, {
         slot: e.slot, lane: e.lane, checkType: e.check_type,
@@ -673,6 +695,8 @@ async function verifyLedger(file, progress) {
       const k = key(e.slot, e.lane), want = (cursor.get(k) ?? 0) + 1;
       if (!isInt(e.position) || e.position < 1 || e.position > chainLen) fail(`structure: seq ${e.seq} position outside chain_length`);
       if (e.position !== want) fail(`inv 7: seq ${e.seq} ${e.slot}/${e.lane} position ${e.position}, expected ${want}`);
+      const w = watermark.get(k) ?? 0;
+      if (isInt(e.position) && e.position <= w) fail(`inv 22: seq ${e.seq} concerns ${k} position ${e.position} already disclosed through ${w}`);
       cursor.set(k, e.position);
       bump(maxConc, k, e.position);
       (drawsByLane.get(k) ?? drawsByLane.set(k, []).get(k)).push({ seq: e.seq, pos: e.position });
@@ -736,12 +760,15 @@ async function verifyLedger(file, progress) {
       M.oob.push(e);
     } else if (e.kind === 'activation-declare') {
       const d = e.declaration;
-      const ok = exactKeys(d, ['version','slot','lanes','label_commit','nonce','declared_at','beacon'], `seq ${e.seq} activation declaration`);
+      const activationFields = ['version','slot','lanes','label_commit','nonce','declared_at','beacon'];
+      const hasRoleClass = typeof d === 'object' && d !== null && 'role_class' in d;
+      const ok = exactKeys(d, hasRoleClass ? [...activationFields, 'role_class'] : activationFields, `seq ${e.seq} activation declaration`);
       const bok = d?.beacon && exactKeys(d.beacon, ['chain','round','genesis_time','period'], `seq ${e.seq} activation beacon`);
       if (!ok || !bok || d.version !== 'wotw-column/1' || d.slot !== deferredQ[activatedCount]
           || !Array.isArray(d.lanes) || !d.lanes.length || new Set(d.lanes).size !== d.lanes.length
           || d.lanes.some(l => !LANE_RE.test(String(l))) || typeof d.nonce !== 'string' || !d.nonce
           || typeof d.label_commit !== 'string' || !HEX64.test(d.label_commit)
+          || (hasRoleClass && d.role_class !== 'player' && d.role_class !== 'non-player')
           || typeof d.beacon.chain !== 'string' || !isInt(d.beacon.round) || d.beacon.round < 1
           || !isInt(d.beacon.genesis_time) || d.beacon.genesis_time < 0
           || !isInt(d.beacon.period) || d.beacon.period < 1 || !validTs(d.declared_at))
@@ -751,7 +778,9 @@ async function verifyLedger(file, progress) {
       if (pendingActivation === null) fail(`structure: seq ${e.seq} activate has no preceding activation-declare`);
       const rec = e.activation_record;
       if (typeof rec !== 'object' || rec === null || typeof rec.slot !== 'string') { fail(`structure: seq ${e.seq} malformed activation_record`); continue; }
-      exactKeys(rec, ['version','slot','lanes','label_commit','nonce','declared_at','beacon'], `seq ${e.seq} activation_record`);
+      const activationFields = ['version','slot','lanes','label_commit','nonce','declared_at','beacon'];
+      exactKeys(rec, 'role_class' in rec ? [...activationFields, 'role_class'] : activationFields, `seq ${e.seq} activation_record`);
+      if ('role_class' in rec && rec.role_class !== 'player' && rec.role_class !== 'non-player') fail(`structure: seq ${e.seq} malformed activation_record`);
       exactKeys(rec.beacon, ['chain','round','genesis_time','period','randomness'], `seq ${e.seq} activation beacon`);
       const expected = deferredQ[activatedCount];
       if (rec.slot !== expected) fail(`inv 16: seq ${e.seq} activation targets ${rec.slot}, expected ${expected}`);
@@ -788,7 +817,7 @@ async function verifyLedger(file, progress) {
             || rec.lanes.some(l => !LANE_RE.test(String(l)))) fail(`structure: seq ${e.seq} malformed activation lanes`);
         if (Object.keys(e.tails ?? {}).sort().join() !== [...(rec.lanes ?? [])].sort().join())
           fail(`structure: seq ${e.seq} activation tails do not match declared lanes`);
-        st.active = true; st.lanes = new Set(rec.lanes ?? []);
+        st.active = true; st.roleClass = rec.role_class ?? null; st.lanes = new Set(rec.lanes ?? []);
         try { st.A = sha256(canonicalBytes(rec)); } catch { fail(`structure: seq ${e.seq} unhashable activation_record`); }
         actRecords.set(rec.slot, rec);
         M.activations.push(e);
@@ -816,6 +845,12 @@ async function verifyLedger(file, progress) {
       if (t <= w) fail(`inv 22: seq ${e.seq} through_position ${t} must exceed watermark ${w}`);
       const mc = maxConc.get(k) ?? 0;
       if (t > mc) fail(`inv 22: seq ${e.seq} through_position ${t} exceeds highest concerned position ${mc}`);
+      const consumed = cursor.get(k) ?? 0;
+      if (t > consumed) {
+        let next = e.seq + 1;
+        while (entries[next]?.kind === 'disclose') next++;
+        if (entries[next]?.kind !== 'final-reveal') fail(`inv 22: seq ${e.seq} through_position ${t} exceeds highest consumed position ${consumed} outside final reveal`);
+      }
       // one forward walk serves inv 21, 23, and 24 — O(t), not O(t²)
       let chainOk = false, walk = null;
       if (typeof e.preimage === 'string' && HEX64.test(e.preimage)) {
@@ -862,6 +897,13 @@ async function verifyLedger(file, progress) {
       if (sessionOpen) fail(`structure: seq ${e.seq} final-reveal while a session is open`);
       if (finalReveal !== null) fail(`structure: seq ${e.seq} second final-reveal`);
       else finalReveal = e;
+      for (const [k, mc] of maxConc) {
+        const w = watermark.get(k) ?? 0;
+        if (w !== mc) fail(`inv 25: final-reveal leaves ${k} disclosed through ${w}, expected ${mc}`);
+      }
+      for (const laneCarriers of carriers.values()) for (const carrier of laneCarriers) {
+        if (carrier.seq < e.seq && !openedSeqs.has(carrier.seq)) fail(`inv 25: final-reveal leaves commitment at seq ${carrier.seq} unopened`);
+      }
     } else if (e.kind === 'closed') {
       if (typeof e.reason !== 'string' || !e.reason.trim()) fail(`structure: seq ${e.seq} malformed closed`);
       if (closedSeq !== null) fail(`structure: seq ${e.seq} second closed`);
@@ -909,9 +951,12 @@ async function verifyLedger(file, progress) {
         } catch { ok = false; }
         if (!ok) fail(`inv 25: label for ${l.slot} does not recompute`);
         else {
+          const expectedClass = l.role === 'player' ? 'player' : 'non-player';
+          if (rec.role_class !== undefined && rec.role_class !== expectedClass)
+            fail(`inv 25: label for ${l.slot} role does not match activation role_class`);
           M.labels.push(l);
           const st = slots.get(l.slot);
-          if (st) { st.role = l.role; st.display = l.display; }
+          if (st) { st.role = l.role; st.roleClass = expectedClass; st.display = l.display; }
           for (const [seq, d] of drawRecs) {
             if (d.slot !== l.slot) continue;
             const t = registry.get(d.checkType);
@@ -1120,17 +1165,16 @@ function render(res) {
       : c.attribution === 'legacy' ? 'legacy / unattributed'
       : c.attribution === 'malformed' ? 'malformed @mod'
       : 'sealed';
-    const nonPlayer = M.slots.get(c.slot)?.role && M.slots.get(c.slot).role !== 'player';
     let note, cls = 'mut';
     if (c.status === 'match') { note = c.attribution === 'legacy' ? '✓ legacy fallback' : '✓'; cls = 'ok'; }
     else if (c.status === 'mismatch') { note = 'differs (advisory)'; cls = 'warn'; }
     else if (c.status === 'manual_override') note = 'deliberate override';
     else if (c.status === 'legacy') { note = 'legacy / unattributed'; cls = 'warn'; }
     else if (c.status === 'malformed') { note = 'malformed directive (advisory)'; cls = 'warn'; }
-    else if (c.status === 'unavailable') {
-      note = nonPlayer ? 'private sheet; not cross-checkable' : 'no applicable profile value (advisory)';
-      cls = nonPlayer ? 'mut' : 'warn';
-    } else note = 'sealed';
+    else if (c.status === 'unavailable') { note = 'no applicable profile value (advisory)'; cls = 'warn'; }
+    else if (c.status === 'private') note = 'private sheet; not cross-checkable';
+    else if (c.status === 'role_sealed') note = 'role sealed; sheet not cross-checkable';
+    else note = 'sealed';
     mc.append(h('tr', {}, h('td', {}, c.seq), h('td', {}, c.slot), h('td', {}, c.check_type),
       h('td', {}, c.date), h('td', {}, attr ?? '—'), h('td', {}, c.modifier ?? '—'),
       h('td', {}, c.sheet_modifier ?? '—'), h('td', { class: cls }, note)));

@@ -11,7 +11,10 @@
 import { canonicalBytes } from './canonical.ts';
 import * as C from './crypto.ts';
 import { entryHash, ZERO64, LEDGER_FORMAT } from './ledger.ts';
-import { validProfileName } from './profile.ts';
+import {
+  applicableSheet, parseModDirective, ParsedModDirective, SheetSnapshot, validDate, validProfileName,
+} from './profile.ts';
+export { parseModDirective } from './profile.ts';
 
 const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -19,10 +22,6 @@ const validTimestamp = (s: unknown): s is string =>
   typeof s === 'string' && TS_RE.test(s)
   && Number.isFinite(Date.parse(s))
   && new Date(s).toISOString().replace('.000Z', 'Z') === s;
-const validDate = (s: unknown): s is string =>
-  typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s)
-  && Number.isFinite(Date.parse(`${s}T00:00:00Z`))
-  && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
 
 /** Well-known drand chains (§2.8): recognized hash ⇒ params must match. */
 export const KNOWN_CHAINS: Record<string, { genesis_time: number; period: number }> = {
@@ -102,41 +101,12 @@ export interface ModifierCheck {
   attribution: 'profile' | 'manual' | 'legacy' | 'malformed' | 'sealed';
   profile: string | null;
   sheet_modifier: number | null;
-  status: 'match' | 'mismatch' | 'manual_override' | 'legacy' | 'malformed' | 'unavailable' | 'sealed';
-}
-
-type ParsedModDirective =
-  | { kind: 'profile'; name: string }
-  | { kind: 'manual' }
-  | { kind: 'legacy' }
-  | { kind: 'malformed' }
-  | { kind: 'sealed' };
-
-/** Parse only the canonical final-line audit directive. Never throws. */
-export function parseModDirective(context: string): ParsedModDirective {
-  const lines = context.split(/\r\n|[\r\n\u2028\u2029]/u);
-  const directiveLines = lines
-    .map((line, index) => ({ line, index }))
-    .filter(({ line }) => /^@mod(?:\s|$)/u.test(line));
-  if (directiveLines.length === 0) return { kind: 'legacy' };
-  if (directiveLines.length !== 1 || directiveLines[0].index !== lines.length - 1) {
-    return { kind: 'malformed' };
-  }
-  const line = directiveLines[0].line;
-  if (line === '@mod manual') return { kind: 'manual' };
-  if (!line.startsWith('@mod ')) return { kind: 'malformed' };
-  const encoded = line.slice(5);
-  try {
-    const name = JSON.parse(encoded);
-    if (typeof name === 'string' && validProfileName(name) && JSON.stringify(name) === encoded) {
-      return { kind: 'profile', name };
-    }
-  } catch { /* advisory parser: malformed input is classified below */ }
-  return { kind: 'malformed' };
+  status: 'match' | 'mismatch' | 'manual_override' | 'legacy' | 'malformed' | 'unavailable' | 'sealed' | 'private' | 'role_sealed';
 }
 
 interface SlotState {
   role: string | null;
+  roleClass: 'player' | 'non-player' | null;
   lanes: Set<string> | null;
   active: boolean;
   retired: boolean;
@@ -154,10 +124,15 @@ function modifierCrossChecks(
 ): { modifier_checks: ModifierCheck[]; advisories: string[] } {
   const checks: ModifierCheck[] = [];
   const advisories: string[] = [];
-  const sheets = entries.filter((e) => e?.kind === 'sheet-update'
+  const sheets = entries.filter((e): e is SheetSnapshot => e?.kind === 'sheet-update'
     && Number.isInteger(e.seq) && typeof e.slot === 'string' && validDate(e.effective_from)
     && e.modifiers && typeof e.modifiers === 'object' && !Array.isArray(e.modifiers));
-
+  const sheetsBySlot = new Map<string, SheetSnapshot[]>();
+  for (const sheet of sheets) {
+    const slotSheets = sheetsBySlot.get(sheet.slot) ?? [];
+    slotSheets.push(sheet);
+    sheetsBySlot.set(sheet.slot, slotSheets);
+  }
   for (const draw of entries) {
     if (draw?.kind !== 'draw' || !Number.isInteger(draw.seq)
         || typeof draw.slot !== 'string' || typeof draw.check_type !== 'string') continue;
@@ -165,13 +140,12 @@ function modifierCrossChecks(
     const modifierValue = Number.isInteger(draw.modifier) ? draw.modifier
       : Number.isInteger(openedValues.modifier) ? openedValues.modifier as number : null;
     const date = typeof draw.ts === 'string' ? draw.ts.slice(0, 10) : '';
-    const applicable = sheets.filter((sheet) => sheet.slot === draw.slot
-      && sheet.seq < draw.seq && sheet.effective_from <= date)
-      .sort((a, b) => (a.effective_from < b.effective_from ? -1
-        : a.effective_from > b.effective_from ? 1 : a.seq - b.seq))
-      .at(-1);
-    const isPlayer = slots.get(draw.slot)?.role === 'player'
-      || sheets.some((sheet) => sheet.slot === draw.slot);
+    const applicable = applicableSheet(sheetsBySlot.get(draw.slot) ?? [], draw.slot, draw.seq, date);
+    const slot = slots.get(draw.slot);
+    const isPlayer = slot?.role === 'player' || slot?.roleClass === 'player';
+    const isPrivate = slot?.role === 'npc' || slot?.role === 'world'
+      || slot?.roleClass === 'non-player';
+    const isRoleSealed = slot?.role === null && slot?.roleClass === null;
 
     let parsed: ParsedModDirective;
     if (typeof draw.context === 'string') parsed = parseModDirective(draw.context);
@@ -185,7 +159,9 @@ function modifierCrossChecks(
     let sheetModifier: number | null = null;
     let status: ModifierCheck['status'];
 
-    if (parsed.kind === 'sealed') status = 'sealed';
+    if (isPrivate) status = 'private';
+    else if (isRoleSealed) status = 'role_sealed';
+    else if (parsed.kind === 'sealed') status = 'sealed';
     else if (parsed.kind === 'manual') {
       status = 'manual_override';
     } else if (parsed.kind === 'malformed') {
@@ -195,7 +171,7 @@ function modifierCrossChecks(
       advisories.push(`modifier: seq ${draw.seq} legacy/unattributed context`);
       const fallback = applicable?.modifiers?.[draw.check_type];
       if (Number.isInteger(fallback)) {
-        sheetModifier = fallback;
+        sheetModifier = fallback as number;
         if (modifierValue === null) status = 'sealed';
         else if (modifierValue === fallback) status = 'match';
         else {
@@ -209,7 +185,7 @@ function modifierCrossChecks(
         status = 'unavailable';
         if (isPlayer) advisories.push(`modifier: seq ${draw.seq} no applicable sheet value for profile ${JSON.stringify(parsed.name)}`);
       } else {
-        sheetModifier = saved;
+        sheetModifier = saved as number;
         if (modifierValue === null) status = 'sealed';
         else if (modifierValue === saved) status = 'match';
         else {
@@ -322,6 +298,10 @@ export function verifyLedger(file: any): VerifyResult {
   };
   const addCarrier = (k: string, c: Carrier) => {
     if (Object.keys(c.commits).length === 0) return;
+    const w = watermark.get(k) ?? 0;
+    if (c.pos <= w && entries[c.seq]?.kind === 'dc-late') {
+      fail(`inv 22: seq ${c.seq} concerns ${k} position ${c.pos} already disclosed through ${w}`);
+    }
     if (!carriers.has(k)) carriers.set(k, []);
     carriers.get(k)!.push(c);
   };
@@ -344,6 +324,11 @@ export function verifyLedger(file: any): VerifyResult {
     // role is sealed for activated slots — rechecked after final reveal
     if (st.role !== null && !type.roles.includes(st.role)) {
       fail(`inv 10: seq ${e.seq} slot role ${st.role} not in roles of check_type ${e.check_type}`);
+    } else if (st.roleClass === 'player' && !type.roles.includes('player')) {
+      fail(`inv 10: seq ${e.seq} slot role player not in roles of check_type ${e.check_type}`);
+    } else if (st.roleClass === 'non-player'
+        && !type.roles.includes('npc') && !type.roles.includes('world')) {
+      fail(`inv 10: seq ${e.seq} slot role non-player not in roles of check_type ${e.check_type}`);
     }
     return type;
   };
@@ -461,7 +446,10 @@ export function verifyLedger(file: any): VerifyResult {
               fail(`structure: genesis active slot ${s.id} malformed`);
               continue;
             }
-            slots.set(s.id, { role: s.role, lanes: new Set(s.lanes), active: true, retired: false, A: null });
+            slots.set(s.id, {
+              role: s.role, roleClass: s.role === 'player' ? 'player' : 'non-player',
+              lanes: new Set(s.lanes), active: true, retired: false, A: null,
+            });
             for (const lane of s.lanes) {
               const tail = e.tails?.[s.id]?.[lane];
               if (typeof tail !== 'string' || !HEX64_RE.test(tail)) {
@@ -474,7 +462,7 @@ export function verifyLedger(file: any): VerifyResult {
             if (!fieldsOk || s.role !== null || s.display !== null || s.lanes !== null || s.nonce !== null) {
               fail(`structure: genesis deferred slot ${s.id} is not empty`);
             }
-            slots.set(s.id, { role: null, lanes: null, active: false, retired: false, A: null });
+            slots.set(s.id, { role: null, roleClass: null, lanes: null, active: false, retired: false, A: null });
             deferredQueue.push(s.id);
           }
         }
@@ -513,9 +501,11 @@ export function verifyLedger(file: any): VerifyResult {
         const st = slots.get(e.slot);
         if (!st || !st.active || st.retired) {
           fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
-        } else if (st.role === null) {
+        } else if (st.roleClass === 'non-player') {
+          fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
+        } else if (st.role === null && st.roleClass === null) {
           pendingSheetUpdates.push({ seq: e.seq, slot: e.slot });
-        } else if (st.role !== 'player') {
+        } else if (st.role !== null && st.role !== 'player') {
           fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
         }
         if (!validDate(e.effective_from)
@@ -551,6 +541,10 @@ export function verifyLedger(file: any): VerifyResult {
         const k = laneKey(e.slot, e.lane);
         const reservation = (cursor.get(k) ?? 0) + 1;
         if (reservation > chainLen) fail(`structure: seq ${e.seq} reservation exceeds chain_length`);
+        const w = watermark.get(k) ?? 0;
+        if (reservation <= w) {
+          fail(`inv 22: seq ${e.seq} concerns ${k} position ${reservation} already disclosed through ${w}`);
+        }
         bump(maxConcerned, k, reservation);
         openAnnounces.set(e.seq, {
           slot: e.slot, lane: e.lane, checkType: e.check_type,
@@ -610,6 +604,10 @@ export function verifyLedger(file: any): VerifyResult {
           fail(`structure: seq ${e.seq} position outside chain_length`);
         }
         if (e.position !== want) fail(`inv 7: seq ${e.seq} ${e.slot}/${e.lane} position ${e.position}, expected ${want}`);
+        const w = watermark.get(k) ?? 0;
+        if (Number.isInteger(e.position) && e.position <= w) {
+          fail(`inv 22: seq ${e.seq} concerns ${k} position ${e.position} already disclosed through ${w}`);
+        }
         cursor.set(k, e.position);
         bump(maxConcerned, k, e.position);
         if (!drawsByLane.has(k)) drawsByLane.set(k, []);
@@ -706,8 +704,10 @@ export function verifyLedger(file: any): VerifyResult {
 
       case 'activation-declare': {
         const d = e.declaration;
+        const activationFields = ['version', 'slot', 'lanes', 'label_commit', 'nonce', 'declared_at', 'beacon'];
+        const hasRoleClass = typeof d === 'object' && d !== null && 'role_class' in d;
         const fieldsOk = exactKeys(d,
-          ['version', 'slot', 'lanes', 'label_commit', 'nonce', 'declared_at', 'beacon'],
+          hasRoleClass ? [...activationFields, 'role_class'] : activationFields,
           `seq ${e.seq} activation declaration`);
         const beaconFieldsOk = d?.beacon && exactKeys(d.beacon,
           ['chain', 'round', 'genesis_time', 'period'], `seq ${e.seq} activation beacon`);
@@ -718,6 +718,7 @@ export function verifyLedger(file: any): VerifyResult {
             || d.lanes.some((lane: unknown) => !C.LANE_NAME_RE.test(String(lane)))
             || typeof d.nonce !== 'string' || !d.nonce
             || typeof d.label_commit !== 'string' || !HEX64_RE.test(d.label_commit)
+            || (hasRoleClass && d.role_class !== 'player' && d.role_class !== 'non-player')
             || !d.beacon || typeof d.beacon.chain !== 'string'
             || !Number.isInteger(d.beacon.round) || d.beacon.round < 1
             || !Number.isInteger(d.beacon.genesis_time) || d.beacon.genesis_time < 0
@@ -737,8 +738,12 @@ export function verifyLedger(file: any): VerifyResult {
         if (typeof rec !== 'object' || rec === null || typeof rec.slot !== 'string') {
           fail(`structure: seq ${e.seq} malformed activation_record`); break;
         }
-        exactKeys(rec, ['version', 'slot', 'lanes', 'label_commit', 'nonce', 'declared_at', 'beacon'],
+        const activationFields = ['version', 'slot', 'lanes', 'label_commit', 'nonce', 'declared_at', 'beacon'];
+        exactKeys(rec, 'role_class' in rec ? [...activationFields, 'role_class'] : activationFields,
           `seq ${e.seq} activation_record`);
+        if ('role_class' in rec && rec.role_class !== 'player' && rec.role_class !== 'non-player') {
+          fail(`structure: seq ${e.seq} malformed activation_record`);
+        }
         exactKeys(rec.beacon, ['chain', 'round', 'genesis_time', 'period', 'randomness'],
           `seq ${e.seq} activation beacon`);
         const expected = deferredQueue[activatedCount];
@@ -791,6 +796,7 @@ export function verifyLedger(file: any): VerifyResult {
             fail(`structure: seq ${e.seq} activation tails do not match declared lanes`);
           }
           st.active = true;
+          st.roleClass = rec.role_class ?? null;
           st.lanes = new Set(rec.lanes);
           try { st.A = C.sha256(canonicalBytes(rec)); } catch { fail(`structure: seq ${e.seq} unhashable activation_record`); }
           activationRecords.set(rec.slot, rec);
@@ -830,6 +836,14 @@ export function verifyLedger(file: any): VerifyResult {
         if (t <= w) fail(`inv 22: seq ${e.seq} through_position ${t} must exceed watermark ${w}`);
         const mc = maxConcerned.get(k) ?? 0;
         if (t > mc) fail(`inv 22: seq ${e.seq} through_position ${t} exceeds highest concerned position ${mc}`);
+        const consumed = cursor.get(k) ?? 0;
+        if (t > consumed) {
+          let next = e.seq + 1;
+          while (entries[next]?.kind === 'disclose') next++;
+          if (entries[next]?.kind !== 'final-reveal') {
+            fail(`inv 22: seq ${e.seq} through_position ${t} exceeds highest consumed position ${consumed} outside final reveal`);
+          }
+        }
         // one forward walk serves the tail check (inv 21), every commitment
         // recomputation (inv 24), and every derived roll (inv 23) — O(t),
         // not O(t²) per disclosure
@@ -900,6 +914,17 @@ export function verifyLedger(file: any): VerifyResult {
         if (sessionOpen) fail(`structure: seq ${e.seq} final-reveal while a session is open`);
         if (finalReveal !== null) fail(`structure: seq ${e.seq} second final-reveal`);
         else finalReveal = e;
+        for (const [k, mc] of maxConcerned) {
+          const w = watermark.get(k) ?? 0;
+          if (w !== mc) fail(`inv 25: final-reveal leaves ${k} disclosed through ${w}, expected ${mc}`);
+        }
+        for (const laneCarriers of carriers.values()) {
+          for (const carrier of laneCarriers) {
+            if (carrier.seq < e.seq && !openedSeqs.has(carrier.seq)) {
+              fail(`inv 25: final-reveal leaves commitment at seq ${carrier.seq} unopened`);
+            }
+          }
+        }
         break;
       }
 
@@ -968,9 +993,13 @@ export function verifyLedger(file: any): VerifyResult {
         } catch { ok = false; }
         if (!ok) fail(`inv 25: label for ${l.slot} does not recompute`);
         else {
+          const expectedClass = l.role === 'player' ? 'player' : 'non-player';
+          if (rec.role_class !== undefined && rec.role_class !== expectedClass) {
+            fail(`inv 25: label for ${l.slot} role does not match activation role_class`);
+          }
           // role now known: recheck inv 10 for this slot's draws
           const st = slots.get(l.slot);
-          if (st) st.role = l.role;
+          if (st) { st.role = l.role; st.roleClass = expectedClass; }
           for (const [seq, d] of drawRecords) {
             if (d.slot !== l.slot) continue;
             const type = registry.get(d.checkType);

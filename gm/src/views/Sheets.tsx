@@ -13,9 +13,6 @@ interface SheetDraft {
   missingDefaults: Record<string, string>;
   baseline: Record<string, number>;
 }
-interface LatestSheet { seq: number; effective_from: string; modifiers: Record<string, number> }
-type SheetTableState = TableState & { latest_sheets: Record<string, LatestSheet> };
-
 let nextRowId = 0;
 const row = (name = '', value = ''): ProfileRow => ({ id: `profile-${++nextRowId}`, name, value });
 const blankDraft = (): SheetDraft => ({ rows: [], defaults: {}, missingDefaults: {}, baseline: {} });
@@ -27,9 +24,9 @@ const sameModifiers = (a: Record<string, number>, b: Record<string, number>) => 
 const availableTypes = (table: TableState, slot: SlotInfo) =>
   table.registry.filter((t) => t.roles.includes(slot.role ?? '') && slot.lanes.includes(t.lane));
 
-const draftFor = (table: SheetTableState, slot: SlotInfo): SheetDraft => {
+const draftFor = (table: TableState, slot: SlotInfo): SheetDraft => {
   const current = slot.role === 'player'
-    ? table.latest_sheets[slot.id]?.modifiers ?? table.sheets[slot.id] ?? {}
+    ? table.sheets[slot.id] ?? {}
     : table.npc_sheets[slot.id] ?? {};
   const rows = Object.entries(current).map(([name, value]) => row(name, String(value)));
   const byName = new Map(rows.map((r) => [r.name, r.id]));
@@ -45,7 +42,7 @@ const draftFor = (table: SheetTableState, slot: SlotInfo): SheetDraft => {
 };
 
 export function Sheets() {
-  const [table, setTable] = useState<SheetTableState | null>(null);
+  const [table, setTable] = useState<TableState | null>(null);
   const [drafts, setDrafts] = useState<Record<string, SheetDraft>>({});
   const [dates, setDates] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState<string | null>(null);
@@ -53,25 +50,11 @@ export function Sheets() {
 
   const refresh = useCallback(async () => {
     const today = new Date().toISOString().slice(0, 10);
-    const [current, ledger] = await Promise.all([
-      api<TableState>('/api/table'),
-      api<{ entries: any[] }>('/api/ledger'),
-    ]);
-    const latest_sheets: Record<string, LatestSheet> = {};
-    for (const entry of ledger.entries) {
-      if (entry.kind === 'sheet-update' && typeof entry.effective_from === 'string') {
-        latest_sheets[entry.slot] = {
-          seq: entry.seq, effective_from: entry.effective_from, modifiers: { ...entry.modifiers },
-        };
-      }
-    }
-    const next: SheetTableState = { ...current, latest_sheets };
+    const next = await api<TableState>('/api/table');
     setTable(next);
     setDates((old) => {
       const updated = { ...old };
-      for (const [slot, latest] of Object.entries(next.latest_sheets)) {
-        updated[slot] ??= latest.effective_from > today ? latest.effective_from : today;
-      }
+      for (const slot of next.slots) updated[slot.id] ??= today;
       return updated;
     });
     setDrafts((old) => {
@@ -103,7 +86,7 @@ export function Sheets() {
 
   const save = async (slot: SlotInfo) => {
     const draft = drafts[slot.id] ?? blankDraft();
-    const names = draft.rows.map((r) => r.name);
+    const names = draft.rows.map((r) => r.name.normalize('NFC'));
     if (names.some((name) => !validProfileName(name))) {
       setMsg(`${slot.display ?? slot.id}: profile names must be trimmed, non-empty, at most 64 characters, and contain no controls or reserved object names`);
       return;
@@ -114,18 +97,19 @@ export function Sheets() {
     }
     const modifiers: Record<string, number> = {};
     for (const profile of draft.rows) {
+      const canonicalName = profile.name.normalize('NFC');
       if (profile.value.trim() === '' || !Number.isInteger(Number(profile.value))) {
         setMsg(`${slot.display ?? slot.id}: ${profile.name || 'each profile'} needs an integer modifier`);
         return;
       }
-      modifiers[profile.name] = Number(profile.value);
+      modifiers[canonicalName] = Number(profile.value);
     }
     const profilesChanged = !sameModifiers(modifiers, draft.baseline);
     if (slot.role === 'player' && profilesChanged && draft.rows.length === 0) {
       setMsg(`${slot.display ?? slot.id}: a public profile snapshot cannot be empty`);
       return;
     }
-    const nameByRow = new Map(draft.rows.map((r) => [r.id, r.name]));
+    const nameByRow = new Map(draft.rows.map((r) => [r.id, r.name.normalize('NFC')]));
     const defaults: Record<string, string> = {};
     for (const type of availableTypes(table, slot)) {
       const selected = draft.defaults[type.id] ?? '';
@@ -138,29 +122,24 @@ export function Sheets() {
 
     const isPlayer = slot.role === 'player';
     const effective = dates[slot.id] ?? today;
-    let defaultsSaved = false;
     setSaving(slot.id); setMsg(null);
     try {
-      await api('/api/profile-defaults', { slot: slot.id, defaults });
-      defaultsSaved = true;
-      if (profilesChanged) {
-        await api('/api/sheet-update', {
-          slot: slot.id, modifiers,
-          ...(isPlayer ? { effective_from: effective } : {}),
-        });
-        setDrafts((all) => ({
-          ...all,
-          [slot.id]: { ...(all[slot.id] ?? draft), baseline: { ...modifiers } },
-        }));
-      }
+      await api('/api/profiles/save', {
+        slot: slot.id, defaults,
+        ...(profilesChanged ? {
+          modifiers, ...(isPlayer ? { effective_from: effective } : {}),
+        } : {}),
+      });
       setMsg(isPlayer
         ? `${slot.display ?? slot.id}: defaults saved${profilesChanged ? ' with a public profile snapshot' : '; profile snapshot unchanged'}${profilesChanged && effective > today ? ` — defaults apply now; profiles become effective ${effective}` : ''}`
         : `${slot.display ?? slot.id}: private defaults saved${profilesChanged ? ' with profiles' : '; profiles unchanged'}`);
-      await refresh();
+      const next = await api<TableState>('/api/table');
+      setTable(next);
+      const currentSlot = next.slots.find((candidate) => candidate.id === slot.id);
+      if (currentSlot) setDrafts((all) => ({ ...all, [slot.id]: draftFor(next, currentSlot) }));
+      if (isPlayer) setDates((all) => ({ ...all, [slot.id]: today }));
     } catch (e: any) {
-      setMsg(defaultsSaved
-        ? `${slot.display ?? slot.id}: defaults saved privately, but the profile snapshot failed (${e.message}); retry this save`
-        : `${slot.display ?? slot.id}: ${e.message}`);
+      setMsg(`${slot.display ?? slot.id}: ${e.message}`);
       await refresh().catch(() => {});
     } finally { setSaving(null); }
   };
@@ -173,6 +152,7 @@ export function Sheets() {
         const isPlayer = slot.role === 'player';
         const draft = drafts[slot.id] ?? blankDraft();
         const types = availableTypes(table, slot);
+        const scheduled = isPlayer ? table.scheduled_sheets[slot.id] ?? [] : [];
         return (
           <section className="pane sheetpane" key={slot.id}>
             <h2>{slot.display ?? slot.id} <span className="eyebrow">{slot.role} · {isPlayer ? 'public snapshots' : 'private until reveal'}</span></h2>
@@ -212,6 +192,7 @@ export function Sheets() {
               </div>
             </div>
             <div className="sheet-actions">
+              {scheduled.length > 0 && <p className="dim">A separate snapshot is scheduled for {scheduled.map((sheet) => sheet.effective_from).join(', ')}. This editor starts from the profile currently applicable to draws.</p>}
               {isPlayer && <label className="fld">effective from
                 <input type="date" value={dates[slot.id] ?? today} onChange={(e) => setDates((d) => ({ ...d, [slot.id]: e.target.value }))} />
               </label>}

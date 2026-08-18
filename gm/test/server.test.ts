@@ -121,6 +121,19 @@ async function verifyModifierParity(ledger: any) {
   return ts;
 }
 
+async function verifyFailureParity(ledger: any) {
+  const ts = verifyLedger(ledger);
+  const browser = await verifyInBrowser(ledger);
+  const dir = tmp(), path = join(dir, 'ledger.json');
+  writeFileSync(path, JSON.stringify(ledger));
+  const pyRun = spawnSync('python3', [VERIFY_PY, path, '--json'], { encoding: 'utf8' });
+  expect(pyRun.stderr).toBe('');
+  const py = JSON.parse(pyRun.stdout);
+  expect(browser.failures).toEqual(ts.failures);
+  expect(py.failures).toEqual(ts.failures);
+  return ts.failures;
+}
+
 /** Decrypt the private state out-of-band and derive all secret material. */
 function secretMaterial(stateDir: string, ledger: any) {
   const { obj } = decryptJson(readFileSync(join(stateDir, 'private.enc'), 'utf8'), PASS);
@@ -351,13 +364,14 @@ describe('lane isolation (§9.2)', () => {
       await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check', modifier: 2, dc: 10, context: `c${i}` });
     }
     await campaign.sessionClose();
+    await campaign.publish();
     await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 10 });
     const ledger = campaign.ledgerJson();
     expect(verifyLedger(ledger).verdict).toBe('VERIFIED');
     const raw = JSON.stringify(ledger);
     const { links } = secretMaterial(stateDir, ledger);
     for (const [key, lks] of links) {
-      if (key === 'slot-01/sealed') continue;
+      if (key === 'slot-01/sealed' || key === 'slot-01/open') continue;
       // links[N] is the tail — public by design; everything before it is secret
       for (const link of lks.slice(0, -1)) expect(raw).not.toContain(link.toString('hex'));
     }
@@ -415,6 +429,7 @@ describe('ordered allocation (§9.2)', () => {
 
     // and the good path works end to end with the offered default
     await campaign.sessionClose();
+    await campaign.publish();
     const npcLanes = defaultLanesForRole(campaign.tableState().registry, 'npc');
     await campaign.activationDeclare({ display: 'Vic', role: 'npc', lanes: npcLanes, nonce: 'n2' });
     clock.advance(700 * 1000);
@@ -472,7 +487,7 @@ describe('ordered allocation (§9.2)', () => {
     expect(d.entry.modifier).toBe(7);
   });
 
-  it('a later player can publish a sheet and use its modifier', async () => {
+  it('a later player receives Default +0 immediately, then can publish a replacement sheet', async () => {
     const { campaign, clock } = await makeCampaign();
     await campaign.activationDeclare({
       display: 'Cara', role: 'player', lanes: ['sealed', 'open'], nonce: 'cara-supplied-this',
@@ -480,21 +495,36 @@ describe('ordered allocation (§9.2)', () => {
     const pending = campaign.status().pending_activation!;
     expect(pending.player_label_salt).toMatch(/^[0-9a-f]{64}$/);
     const declaration = campaign.ledgerJson().entries[pending.declaration_seq].declaration;
+    expect(declaration.role_class).toBe('player');
     expect(C.labelCommit(Buffer.from(pending.player_label_salt!, 'hex'), 'Cara', 'player'))
       .toBe(declaration.label_commit);
     clock.advance(700 * 1000);
-    await campaign.activationComplete();
+    const activation = await campaign.activationComplete();
+    expect(activation.activation_record.role_class).toBe('player');
+    const bootstrap = campaign.ledgerJson().entries[activation.seq + 1];
+    expect(bootstrap).toMatchObject({
+      kind: 'sheet-update', slot: 'slot-04', effective_from: '2026-08-14',
+      modifiers: { Default: 0 },
+    });
+    expect(campaign.tableState().profile_defaults['slot-04']).toEqual(
+      Object.fromEntries(CHECK_TYPES
+        .filter((type) => type.roles.includes('player') && ['sealed', 'open'].includes(type.lane))
+        .map((type) => [type.id, 'Default'])),
+    );
+    await campaign.sessionOpen();
+    const initial = await campaign.draw({ slot: 'slot-04', check_type: 'rk-general', dc: 20 });
+    expect(initial.modifier).toBe(0);
     await campaign.sheetUpdate({
       slot: 'slot-04', effective_from: '2026-08-14', modifiers: { Society: 9 },
     });
     await campaign.profileDefaults({ slot: 'slot-04', defaults: { 'rk-general': 'Society' } });
-    await campaign.sessionOpen();
     const draw = await campaign.draw({
       slot: 'slot-04', check_type: 'rk-general', dc: 20, context: 'new player acts',
     });
     expect(draw.entry.modifier).toBe(9);
     await campaign.sessionClose();
     expect(verifyLedger(campaign.ledgerJson()).failures).toEqual([]);
+    await campaign.publish();
     await campaign.finalReveal();
     expect(verifyLedger(campaign.ledgerJson()).failures).toEqual([]);
   });
@@ -543,6 +573,7 @@ describe('ordered allocation (§9.2)', () => {
     expect(d.entry.slot).toBe('slot-04');
     await c2.sessionClose();
     expect(verifyLedger(c2.ledgerJson()).failures).toEqual([]);
+    await c2.publish();
     await c2.finalReveal();
     // labels survived the crash: the reveal opens Bud on slot-04
     const fr = c2.ledgerJson().entries.find((e: any) => e.kind === 'final-reveal');
@@ -615,6 +646,32 @@ describe('idempotency (§9.2, §6.5)', () => {
 });
 
 describe('modifier profiles and planned draws', () => {
+  it('recovers an atomic profile/default save if the final private commit fails', async () => {
+    const { campaign, stateDir, publicDir, clock } = await makeCampaign();
+    const originalWritePrivate = (campaign as any).writePrivate.bind(campaign);
+    let writes = 0;
+    (campaign as any).writePrivate = () => {
+      writes++;
+      if (writes === 2) throw new Error('injected final private write failure');
+      return originalWritePrivate();
+    };
+    await expect(campaign.saveProfiles({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 7 },
+      defaults: { 'rk-general': 'Society' },
+    })).rejects.toThrow(/injected/);
+    expect(campaign.ledgerJson().entries.at(-1)).toMatchObject({
+      kind: 'sheet-update', slot: 'slot-01', modifiers: { Society: 7 },
+    });
+
+    campaign.lock();
+    const restored = new Campaign({ stateDir, publicDir, kdf: KDF, now: clock.now });
+    await restored.unlock(PASS);
+    expect(restored.tableState().profile_defaults['slot-01']['rk-general']).toBe('Society');
+    await restored.sessionOpen();
+    expect((await restored.draw({ slot: 'slot-01', check_type: 'rk-general' })).modifier).toBe(7);
+    expect(verifyLedger(restored.ledgerJson()).failures).toEqual([]);
+  });
+
   it('uses complete dated player snapshots and does not fall back after removal', async () => {
     const { campaign } = await makeCampaign();
     await campaign.sheetUpdate({
@@ -640,17 +697,68 @@ describe('modifier profiles and planned draws', () => {
   it('honors effective dates, same-date sequence order, and the strict draw-seq bound', async () => {
     const { campaign, clock } = await makeCampaign();
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 9 } });
-    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
     await campaign.sessionOpen();
-    await expect(campaign.draw({ slot: 'slot-01', check_type: 'rk-general' })).rejects.toThrow(/no modifier recorded/);
+    await expect(campaign.draw({ slot: 'slot-01', check_type: 'rk-general', profile: 'Society' }))
+      .rejects.toThrow(/no modifier recorded/);
     expect(campaign.tableState().sheets['slot-01']).toEqual({ Default: 0 });
     clock.advance(24 * 3600 * 1000);
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 10 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
     const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general' });
     expect(draw.modifier).toBe(10);
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 99 } });
     expect((campaign as any).playerSheetMod('slot-01', 'Society', draw.entry.seq, '2026-08-15')).toBe(10);
     expect(campaign.tableState().sheets['slot-01']).toEqual({ Society: 10 });
+  });
+
+  it('validates atomic defaults against the snapshot that will actually be current', async () => {
+    const { campaign, clock } = await makeCampaign();
+    await campaign.saveProfiles({
+      slot: 'slot-01', effective_from: '2026-08-16', modifiers: { Arcana: 8 },
+      defaults: { 'rk-general': 'Default' },
+    });
+    clock.advance(2 * 24 * 3600 * 1000);
+    const before = campaign.ledgerJson().entries.length;
+    await expect(campaign.saveProfiles({
+      slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 6 },
+      defaults: { 'rk-general': 'Society' },
+    })).rejects.toThrow(/not available/);
+    expect(campaign.ledgerJson().entries).toHaveLength(before);
+    expect(campaign.tableState().sheets['slot-01']).toEqual({ Arcana: 8 });
+    expect(campaign.tableState().profile_defaults['slot-01']['rk-general']).toBe('Default');
+  });
+
+  it('retains every future transition and normalizes profile identifiers atomically', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2099-02-01', modifiers: { Future: 1 },
+    });
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2099-01-01', modifiers: { Earlier: 2 },
+    });
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2099-02-01', modifiers: { Replacement: 3 },
+    });
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Current: 4 },
+    });
+    expect(campaign.tableState().scheduled_sheets['slot-01']).toEqual([
+      expect.objectContaining({ effective_from: '2099-01-01', modifiers: { Earlier: 2 } }),
+      expect.objectContaining({ effective_from: '2099-02-01', modifiers: { Replacement: 3 } }),
+    ]);
+
+    const decomposed = 'Cafe\u0301';
+    const composed = decomposed.normalize('NFC');
+    await campaign.sheetUpdate({
+      slot: 'slot-02', effective_from: '2026-08-14', modifiers: { [decomposed]: 7 },
+    });
+    expect(campaign.ledgerJson().entries.at(-1).modifiers).toEqual({ [composed]: 7 });
+    const before = campaign.ledgerJson().entries.length;
+    await expect(campaign.sheetUpdate({
+      slot: 'slot-02', effective_from: '2026-08-14',
+      modifiers: { [decomposed]: 7, [composed]: 8 },
+    })).rejects.toThrow(/collide after NFC normalization/);
+    expect(campaign.ledgerJson().entries).toHaveLength(before);
   });
 
   it('replaces NPC maps, rejects dates, and keeps defaults private', async () => {
@@ -672,6 +780,51 @@ describe('modifier profiles and planned draws', () => {
     await campaign.sessionOpen();
     await expect(campaign.draw({ slot: 'slot-04', check_type: 'npc-secret', dc: 18 }))
       .rejects.toThrow(/no modifier recorded/);
+  });
+
+  it('uses public role_class for private and legacy role-sealed modifier reports', async () => {
+    const { campaign, clock } = await makeCampaign();
+    const declared = await campaign.activationDeclare({
+      display: 'Vic', role: 'npc', lanes: ['open', 'deep'], nonce: 'n',
+    });
+    expect(declared.declaration.declaration.role_class).toBe('non-player');
+    clock.advance(700 * 1000);
+    const activated = await campaign.activationComplete();
+    expect(activated.activation_record.role_class).toBe('non-player');
+    await campaign.sheetUpdate({ slot: 'slot-04', modifiers: { Diplomacy: 3 } });
+    await campaign.profileDefaults({
+      slot: 'slot-04', defaults: { 'public-gm-check': 'Diplomacy' },
+    });
+    await campaign.sessionOpen();
+    const draw = await campaign.draw({ slot: 'slot-04', check_type: 'public-gm-check', dc: 12 });
+    const manual = await campaign.draw({
+      slot: 'slot-04', check_type: 'public-gm-check', dc: 13, modifier: 7,
+    });
+    await campaign.closeAndPublish({ session: 1, late_dcs: [] });
+    const classified = await verifyModifierParity(campaign.ledgerJson());
+    expect(classified.modifier_checks.find((check) => check.seq === draw.entry.seq)?.status)
+      .toBe('private');
+    expect(classified.modifier_checks.find((check) => check.seq === manual.entry.seq))
+      .toMatchObject({ attribution: 'manual', status: 'private' });
+
+    const legacy = structuredClone(campaign.ledgerJson());
+    const declaration = legacy.entries.find((entry: any) => entry.kind === 'activation-declare').declaration;
+    const record = legacy.entries.find((entry: any) => entry.kind === 'activate').activation_record;
+    delete declaration.role_class;
+    delete record.role_class;
+    const prior = legacy.entries.at(-1);
+    const publicSheet: any = {
+      seq: legacy.entries.length, ts: prior.ts, session: prior.session,
+      kind: 'sheet-update', slot: 'slot-04', effective_from: '2026-08-14',
+      modifiers: { Diplomacy: 3 }, prev: legacy.head,
+    };
+    publicSheet.hash = entryHash(publicSheet);
+    legacy.entries.push(publicSheet);
+    legacy.head = publicSheet.hash;
+    const legacyResult = await verifyModifierParity(rehashLedger(legacy));
+    expect(legacyResult.verdict).toBe('VERIFIED');
+    expect(legacyResult.modifier_checks.find((check) => check.seq === draw.entry.seq)?.status)
+      .toBe('role_sealed');
   });
 
   it('rejects malformed profile names at both server write boundaries', async () => {
@@ -714,6 +867,8 @@ describe('modifier profiles and planned draws', () => {
     expect(preview.draws[1].context).toBe('manual check\n@mod manual');
     expect(profiled.entry.context_commit).toMatch(/^[0-9a-f]{64}$/);
     expect(manual.entry.context_commit).toMatch(/^[0-9a-f]{64}$/);
+    await campaign.sessionClose();
+    await campaign.publish();
     await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 2 });
     expect(verifyLedger(campaign.ledgerJson()).verdict).toBe('VERIFIED');
   });
@@ -757,6 +912,8 @@ describe('modifier profiles and planned draws', () => {
     });
     expect(batch.entries.map((e) => e.seq)).toEqual([batch.entries[0].seq, batch.entries[0].seq + 1]);
     expect(new Set(batch.entries.map((e) => e.ts)).size).toBe(1);
+    await campaign.sessionClose();
+    await campaign.publish();
     await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 1 });
     await campaign.disclose({ slot: 'slot-02', lane: 'sealed', through_position: 1 });
     const opened = campaign.ledgerJson().entries.filter((e: any) => e.kind === 'disclose')
@@ -801,6 +958,8 @@ describe('modifier profiles and planned draws', () => {
     expect(sealed.modifier_checks.find((c) => c.seq === profiled.entry.seq))
       .toMatchObject({ attribution: 'sealed', status: 'sealed', modifier: 6 });
 
+    await campaign.sessionClose();
+    await campaign.publish();
     await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 3 });
     const base = campaign.ledgerJson();
     const verified = await verifyModifierParity(base);
@@ -905,12 +1064,261 @@ describe('modifier profiles and planned draws', () => {
   });
 });
 
+describe('session publication ceremony', () => {
+  it('serializes a concurrent low-level close and publish through a close receipt', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check' });
+    const [, published] = await Promise.all([campaign.sessionClose(), campaign.publish()]);
+    const replay = await campaign.closeAndPublish({ session: 1, late_dcs: [] });
+    expect(replay).toEqual({ ...published, replay: true });
+    expect(replay.close_seq).toBeGreaterThan(0);
+  });
+
+  it('recovers a frozen standalone publication instead of replaying an older head', async () => {
+    const { campaign, stateDir, publicDir, clock } = await makeCampaign();
+    const first = await campaign.publish();
+    await campaign.note('publish me independently');
+    const expectedHead = campaign.ledgerJson().head;
+    rmSync(publicDir, { recursive: true, force: true });
+    writeFileSync(publicDir, 'blocks standalone export');
+    await expect(campaign.publish()).rejects.toBeDefined();
+    await expect(campaign.note('must wait')).rejects.toThrow(/finish publishing head/);
+
+    campaign.lock();
+    const restarted = new Campaign({ stateDir, publicDir, kdf: KDF, now: clock.now });
+    await restarted.unlock(PASS);
+    rmSync(publicDir, { force: true });
+    const recovered = await restarted.publish();
+    expect(recovered.head).toBe(expectedHead);
+    expect(recovered.head).not.toBe(first.head);
+    expect(JSON.parse(readFileSync(join(publicDir, 'ledger.json'), 'utf8').toString()).head)
+      .toBe(expectedHead);
+  });
+
+  it('retries an ambiguous mirror with the same frozen head idempotency key', async () => {
+    const witness = join(tmp(), 'mirror-heads');
+    const { campaign } = await makeCampaign({
+      mirrorCommand: `printf '%s\\n' "$COLUMN_PUBLISH_HEAD" >> '${witness}'`,
+    });
+    const originalWritePrivate = (campaign as any).writePrivate.bind(campaign);
+    let writes = 0;
+    (campaign as any).writePrivate = () => {
+      writes++;
+      if (writes === 2) throw new Error('crash after mirror');
+      return originalWritePrivate();
+    };
+    await expect(campaign.publish()).rejects.toThrow(/crash after mirror/);
+    (campaign as any).writePrivate = originalWritePrivate;
+    const recovered = await campaign.publish();
+    const attempts = readFileSync(witness, 'utf8').trim().split('\n');
+    expect(attempts).toEqual([recovered.head, recovered.head]);
+  });
+
+  it('keeps a close receipt pending when its post-mirror state write fails', async () => {
+    const witness = join(tmp(), 'close-mirror-heads');
+    const { campaign } = await makeCampaign({
+      mirrorCommand: `printf '%s\\n' "$COLUMN_PUBLISH_HEAD" >> '${witness}'`,
+    });
+    await campaign.sessionOpen();
+    await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check' });
+    const originalWritePrivate = (campaign as any).writePrivate.bind(campaign);
+    let writes = 0;
+    (campaign as any).writePrivate = () => {
+      writes++;
+      if (writes === 2) throw new Error('crash after close mirror');
+      return originalWritePrivate();
+    };
+    await expect(campaign.closeAndPublish({ session: 1, late_dcs: [] }))
+      .rejects.toThrow(/crash after close mirror/);
+    expect(campaign.status()).toMatchObject({ close_pending: true, close_pending_session: 1 });
+    (campaign as any).writePrivate = originalWritePrivate;
+    const recovered = await campaign.closeAndPublish({ session: 1, late_dcs: [] });
+    const attempts = readFileSync(witness, 'utf8').trim().split('\n');
+    expect(attempts).toEqual([recovered.head, recovered.head]);
+  });
+
+  it('atomically closes, discloses open lanes, publishes, and safely retries', async () => {
+    const { campaign, publicDir } = await makeCampaign();
+    await campaign.sessionOpen();
+    const draw = await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check' });
+    await expect((campaign as any).closeAndPublish({ session: 1 }))
+      .rejects.toThrow(/late_dcs/);
+    expect(campaign.status().session_open).toBe(true);
+    const first = await campaign.closeAndPublish({
+      session: 1,
+      late_dcs: [{ target_seq: draw.entry.seq, dc: 17 }],
+    });
+    expect(campaign.status().session_open).toBe(false);
+    expect(campaign.tableState().lanes['slot-01/open'].watermark).toBe(1);
+    const entries = campaign.ledgerJson().entries;
+    expect(entries.slice(-3).map((entry: any) => entry.kind))
+      .toEqual(['dc-late', 'session-close', 'disclose']);
+    const artifact = JSON.parse(readFileSync(join(publicDir, 'ledger.json'), 'utf8'));
+    expect(artifact.head).toBe(first.head);
+    expect(verifyLedger(artifact).failures).toEqual([]);
+
+    const beforeRetry = entries.length;
+    const retry = await campaign.closeAndPublish({
+      session: 1,
+      late_dcs: [{ target_seq: draw.entry.seq, dc: 17 }],
+    });
+    expect(retry).toEqual({ ...first, replay: true });
+    expect(campaign.ledgerJson().entries).toHaveLength(beforeRetry);
+    await expect(campaign.closeAndPublish({
+      session: 1,
+      late_dcs: [{ target_seq: draw.entry.seq, dc: 18 }],
+    })).rejects.toThrow(/different DC/);
+
+    await campaign.sessionOpen();
+    const openHead = campaign.ledgerJson().head;
+    expect(await campaign.closeAndPublish({ session: 1, late_dcs: [] }))
+      .toEqual({ ...first, replay: true });
+    expect(campaign.ledgerJson().head).toBe(openHead);
+    expect(campaign.status().session_open).toBe(true);
+  });
+
+  it('rejects standalone publish during an open session without mutation', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check' });
+    const before = campaign.ledgerJson();
+    await expect(campaign.publish()).rejects.toThrow(/close the current session/);
+    expect(campaign.ledgerJson()).toEqual(before);
+  });
+
+  it('discloses a previous open lane before an adjacent activation declaration', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check' });
+    await campaign.sessionClose(); // exercise the legacy low-level endpoint
+    await expect(campaign.activationDeclare({
+      display: 'Cara', role: 'player', lanes: ['sealed', 'open'], nonce: 'cara',
+    })).rejects.toThrow(/finish publishing session 1/);
+    await campaign.publish();
+    const declared = await campaign.activationDeclare({
+      display: 'Cara', role: 'player', lanes: ['sealed', 'open'], nonce: 'cara',
+    });
+    const entries = campaign.ledgerJson().entries;
+    expect(entries[declared.declaration.seq - 1]).toMatchObject({
+      kind: 'disclose', slot: 'slot-01', lane: 'open', through_position: 1,
+    });
+    expect(entries.at(-1).kind).toBe('activation-declare');
+  });
+
+  it('resumes publication after local close/disclosure succeeded but export failed', async () => {
+    const { campaign, stateDir, publicDir, clock } = await makeCampaign();
+    await campaign.sessionOpen();
+    await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check' });
+    rmSync(publicDir, { recursive: true, force: true });
+    writeFileSync(publicDir, 'blocks creation of publicDir/ledger.json');
+    await expect(campaign.closeAndPublish({ session: 1, late_dcs: [] })).rejects.toBeDefined();
+    expect(campaign.status()).toMatchObject({
+      session_open: false, close_pending: true, close_pending_session: 1,
+    });
+    expect(campaign.ledgerJson().entries.at(-1).kind).toBe('disclose');
+    await expect(campaign.sessionOpen()).rejects.toThrow(/finish publishing session 1/);
+    await expect(campaign.note('must wait')).rejects.toThrow(/finish publishing session 1/);
+    await expect(campaign.finalReveal()).rejects.toThrow(/finish publishing session 1/);
+
+    campaign.lock();
+    const restarted = new Campaign({ stateDir, publicDir, kdf: KDF, now: clock.now });
+    await restarted.unlock(PASS);
+    expect(restarted.status()).toMatchObject({ close_pending: true, close_pending_session: 1 });
+    rmSync(publicDir, { force: true });
+    const resumed = await restarted.closeAndPublish({ session: 1, late_dcs: [] });
+    expect(restarted.status().close_pending).toBe(false);
+    expect(JSON.parse(readFileSync(join(publicDir, 'ledger.json'), 'utf8')).head).toBe(resumed.head);
+  });
+
+  it('does not disclose a void reservation until reuse consumes it or final reveal opens it', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    const first = await campaign.announce({
+      slot: 'slot-01', check_type: 'rk-cosmology', context: 'abandoned', initiator: 'gm',
+    });
+    await campaign.voidAnnounce({ announce_seq: first.seq, reason: 'wrong question' });
+    await campaign.closeAndPublish({ session: 1, late_dcs: [] });
+    expect(campaign.ledgerJson().entries.some((entry: any) =>
+      entry.kind === 'disclose' && entry.slot === 'slot-01' && entry.lane === 'sealed')).toBe(false);
+
+    await campaign.sessionOpen();
+    const reused = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', modifier: 4, dc: 15 });
+    expect(reused.entry.position).toBe(1);
+    await campaign.closeAndPublish({ session: 2, late_dcs: [] });
+    const disclosure = await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 1 });
+    expect(disclosure.opened.map((opened: any) => opened.seq)).toContain(first.seq);
+    expect(disclosure.opened.map((opened: any) => opened.seq)).toContain(reused.entry.seq);
+    expect(verifyLedger(campaign.ledgerJson()).failures).toEqual([]);
+
+    const { campaign: trailing } = await makeCampaign();
+    await trailing.sessionOpen();
+    const reserved = await trailing.announce({
+      slot: 'slot-01', check_type: 'rk-cosmology', context: 'trailing', initiator: 'gm',
+    });
+    await trailing.voidAnnounce({ announce_seq: reserved.seq, reason: 'never rolled' });
+    await trailing.closeAndPublish({ session: 1, late_dcs: [] });
+    await expect(trailing.disclose({
+      slot: 'slot-01', lane: 'sealed', through_position: 1,
+    })).rejects.toThrow(/highest consumed position 0/);
+    await trailing.finalReveal();
+    expect(trailing.ledgerJson().entries.find((entry: any) => entry.kind === 'disclose')?.opened)
+      .toContainEqual(expect.objectContaining({ seq: reserved.seq }));
+    expect(verifyLedger(trailing.ledgerJson()).failures).toEqual([]);
+  });
+
+  it('rejects a rehashed post-watermark draw identically in every verifier', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check', modifier: 2, dc: 10 });
+    await campaign.closeAndPublish({ session: 1, late_dcs: [] });
+    await campaign.sessionOpen();
+    const second = await campaign.draw({ slot: 'slot-01', check_type: 'public-gm-check', modifier: 3, dc: 11 });
+    const forged = structuredClone(campaign.ledgerJson());
+    forged.entries[second.entry.seq].position = 1;
+    rehashLedger(forged);
+    const diagnostic = `inv 22: seq ${second.entry.seq} concerns slot-01/open position 1 already disclosed through 1`;
+    const failures = await verifyFailureParity(forged);
+    expect(failures.filter((failure) => failure === diagnostic)).toEqual([diagnostic]);
+  });
+
+  it('permits over-cursor disclosure only in a complete final-reveal block', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    const reservation = await campaign.announce({
+      slot: 'slot-01', check_type: 'rk-cosmology', context: 'trailing', initiator: 'gm',
+    });
+    await campaign.voidAnnounce({ announce_seq: reservation.seq, reason: 'unused' });
+    await campaign.closeAndPublish({ session: 1, late_dcs: [] });
+    await campaign.finalReveal();
+    const valid = campaign.ledgerJson();
+    expect((await verifyFailureParity(valid))).toEqual([]);
+
+    const premature = structuredClone(valid);
+    premature.entries.pop();
+    rehashLedger(premature);
+    const disclosure = premature.entries.find((entry: any) => entry.kind === 'disclose');
+    expect(await verifyFailureParity(premature)).toContain(
+      `inv 22: seq ${disclosure.seq} through_position 1 exceeds highest consumed position 0 outside final reveal`,
+    );
+
+    const incomplete = structuredClone(valid);
+    const disclosureAt = incomplete.entries.findIndex((entry: any) => entry.kind === 'disclose');
+    incomplete.entries.splice(disclosureAt, 1);
+    incomplete.entries.forEach((entry: any, seq: number) => { entry.seq = seq; });
+    rehashLedger(incomplete);
+    const failures = await verifyFailureParity(incomplete);
+    expect(failures).toContain('inv 25: final-reveal leaves slot-01/sealed disclosed through 0, expected 1');
+    expect(failures).toContain(`inv 25: final-reveal leaves commitment at seq ${reservation.seq} unopened`);
+  });
+});
+
 describe('append-only (§6.3)', () => {
   it('refuses to start on a tampered ledger', async () => {
     const { campaign, stateDir, publicDir, clock } = await makeCampaign();
     await campaign.sessionOpen();
     await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', modifier: 5, dc: 18 });
-    await campaign.publish();
+    await campaign.closeAndPublish({ session: 1, late_dcs: [] });
     campaign.lock();
     const p = join(stateDir, 'ledger.json');
     const text = readFileSync(p, 'utf8');
@@ -926,7 +1334,7 @@ describe('lock state over HTTP (§6.4, §9.2)', () => {
     const { campaign, stateDir, publicDir, clock } = await makeCampaign();
     await campaign.sessionOpen();
     await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', modifier: 5, dc: 18 });
-    await campaign.publish();
+    await campaign.closeAndPublish({ session: 1, late_dcs: [] });
     campaign.lock();
     const fresh = new Campaign({ stateDir, publicDir, kdf: KDF, now: clock.now });
     expect(fresh.locked).toBe(true); // §12.11: comes up locked
@@ -969,13 +1377,22 @@ describe('lock state over HTTP (§6.4, §9.2)', () => {
         headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
         body: JSON.stringify({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5 } }),
       });
-      expect(sheet.status).toBe(200);
-      const defaults = await fetch(`${base}/api/profile-defaults`, {
+      expect(sheet.status).toBe(400);
+      expect((await sheet.json()).error).toMatch(/Default.*not available/);
+      const profiles = await fetch(`${base}/api/profiles/save`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
-        body: JSON.stringify({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } }),
+        body: JSON.stringify({
+          slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5 },
+          defaults: { 'rk-general': 'Society' },
+        }),
       });
-      expect(defaults.status).toBe(200);
+      expect(profiles.status).toBe(200);
+      const opened = await fetch(`${base}/api/session/open`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
+        body: '{}',
+      });
+      expect(opened.status).toBe(200);
       const draw = await fetch(`${base}/api/draw`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
@@ -1011,6 +1428,7 @@ describe('restore from backup (§6.7, §12.13)', () => {
       await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', modifier: 5, dc: 10 + i, context: `draw ${i}` });
     }
     await campaign.sessionClose();
+    await campaign.publish();
     await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 3 });
     campaign.lock();
     // find the latest backup pair, wipe state/, restore only from the backup
@@ -1124,6 +1542,7 @@ describe('full final reveal', () => {
     await campaign.sessionOpen();
     await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', modifier: 5, dc: 18 });
     await campaign.sessionClose();
+    await campaign.publish();
     const [reveal, reopen] = await Promise.allSettled([
       campaign.finalReveal(), campaign.sessionOpen(),
     ]);
@@ -1140,12 +1559,14 @@ describe('full final reveal', () => {
     await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', modifier: 5, dc: 18, context: 'one' });
     await campaign.draw({ slot: 'slot-03', check_type: 'world-routine', modifier: 8, dc: 14, context: 'two' });
     await campaign.sessionClose();
+    await campaign.publish();
     await campaign.activationDeclare({ display: 'Bud', role: 'npc', lanes: ['open'], nonce: 'n1' });
     clock.advance(700_000);
     await campaign.activationComplete();
     await campaign.sessionOpen();
     await campaign.draw({ slot: 'slot-04', check_type: 'public-gm-check', modifier: 2, dc: 10, context: 'npc' });
     await campaign.sessionClose();
+    await campaign.publish();
     await campaign.finalReveal();
     await campaign.close('test over');
     const ledger = campaign.ledgerJson();

@@ -69,7 +69,7 @@ python3 verifier/verify.py --vectors spec/vectors.json
   services.column.gm = {
     enable = true;
     bindAddress = "127.0.0.1";    # behind `tailscale serve`; never public
-    gitMirrorCommand = "git add ledger.json && git commit -m publish && git push";
+    gitMirrorCommand = ''git add ledger.json && (git diff --cached --quiet || git commit -m "publish $COLUMN_PUBLISH_HEAD") && git push'';
   };
   services.column.rehearsal.enable = true; # isolated :7778 service, no mirror
   services.column.public = {
@@ -88,7 +88,9 @@ Front the loopback-bound GM UI with
 unlock passphrase never crosses the tailnet in cleartext (§6.6). The service
 **boots locked** after any reboot: the ledger stays readable, drawing is
 impossible until the passphrase is entered (§6.4). `autoUnlock` exists and is
-off by default — read its warning before enabling.
+off by default — read its warning before enabling. Its passphrase option is an
+absolute runtime path loaded through systemd credentials; the unlock JSON is
+piped to `curl`, so the secret does not appear in its argument list.
 
 ## Backups and the tested restore procedure
 
@@ -137,8 +139,10 @@ to anyone who saved the newer one.
 - Rehearse the ceremony first: `COLUMN_REHEARSAL=1 npm run serve` gives a
   throwaway development campaign, while `services.column.rehearsal.enable`
   provides the same isolation as a persistent NixOS service on port 7778.
-  Both publish into separate state and public directories and refuse mirrors
-  (§7.8).
+  The service runs as `column-rehearsal`, defaults to
+  `/var/lib/column-rehearsal/{state,public}`, cannot read production state or
+  credentials, and refuses mirrors (§7.8). Default-path rehearsal data is
+  throwaway and is not migrated automatically.
 - Post the publish digest to the group chat every session — it is the external
   timestamp anchor, and human memory is the only count control for routine
   draws (§7.7).

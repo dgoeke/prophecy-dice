@@ -300,6 +300,7 @@ One protocol for every later addition — a joining player, a newly-significant 
   "version": "wotw-column/1",
   "slot": "slot-07",
   "lanes": ["sealed", "open"],
+  "role_class": "player",
   "label_commit": "<hex 64>",
   "nonce": "supplied string",
   "declared_at": "2027-01-09T18:00:00Z",
@@ -320,6 +321,12 @@ A            = SHA256(canonical_json(activation_record))
 salt_label   = HKDF-SHA256(ikm = S || E, salt = SALT,
                            info = INFO_PREFIX || utf8(slot_id) || "/#label", length = 32)
 ```
+
+`role_class` is the public classification `player` or `non-player`; it is present
+uniformly on every new declaration. It permits pre-reveal sheet and check-type
+validation without distinguishing NPC from world or exposing a display name.
+Legacy activation records without it remain valid. At final reveal, the exact
+role must agree with the declared class.
 
 `salt_label` is **derived, not stored**: its only job is blinding the low-entropy `{display, role}`, and secrecy needs only `S`. `#` cannot occur in a lane name, so the info string cannot collide with any lane derivation. The IKM deliberately excludes `A` — `A` hashes the activation record, which contains `label_commit`, which needs `salt_label`; including `A` would be circular. At final reveal, `labels` are published and each verifier re-derives the salt itself (§3.2). Hand a joining player their derived salt privately so they can verify their column is theirs.
 
@@ -396,6 +403,10 @@ where `sheet-update.seq < draw.seq` and `effective_from` is no later than the
 UTC date of the draw. A snapshot is complete: omission removes a profile and
 does not fall back to an older snapshot. NPC and world sheets are dateless
 private current-value maps and do not participate in verifier cross-checking.
+Profile identifiers are NFC-normalized, exact, case-sensitive strings.
+Producers normalize before duplicate detection and append; verifiers reject a
+non-NFC sheet key. A malformed non-NFC name inside an `@mod` context directive
+remains advisory because context parsing does not affect the hard ledger.
 
 **NPC and world modifiers seal** (`seal_modifier: true`). Publishing a large hidden-character modifier can reveal that character's approximate level or capabilities.
 
@@ -507,9 +518,9 @@ Compare the total first, then apply the natural-20/natural-1 shift. The verifier
 
 **Leak check (hard failure):** (20) No public entry contains a `link` or any `salt` field at any nesting depth. `result` is allowed only as the root field of an `out-of-band` entry. Publication of a column value outside `disclose` or `final-reveal` is a spec violation and must be reported loudly. (`out-of-band` entries carry `result` by design — physical dice, no position — and MUST NOT carry any `*_commit` field; a sealed commitment is only well-formed on an entry with a concerned position.)
 
-**Disclosure:** (21) For each `disclose`, `chain_step^through_position(preimage) == tail` for that slot and lane. (22) `through_position` strictly increases per `(slot, lane)` and never exceeds the highest concerned position (§2.12) of that slot and lane — draws' positions plus `announce` reservations, so a trailing voided announce can still be opened at final reveal. (23) Derived values: for each draw at position `j ≤ through_position`, `p_j = chain_step^(k-j)(preimage)`, result per §2.11, degree per §2.14 — computed, never trusted. (24) For each `disclose`: `opened` is strictly ascending by `seq` with no duplicates; it contains exactly one element for every commitment-carrying entry (`draw`, `announce`, `dc-late`) of that slot and lane with `seq` before the disclose whose concerned position is ≤ `through_position` and that no earlier `disclose` opened — and no other elements; each element supplies exactly the fields its entry committed (`dc` ↔ `dc_commit`, `modifier` ↔ `mod_commit`, `context` ↔ `context_commit`) and no others; each commitment recomputes from the derived salt (§2.12) and the supplied value.
+**Disclosure:** (21) For each `disclose`, `chain_step^through_position(preimage) == tail` for that slot and lane. (22) `through_position` strictly increases per `(slot, lane)`. Ordinary/manual and session-close disclosure never exceeds the highest **consumed** position (the draw cursor); only final reveal may extend to the highest concerned position to open a trailing voided reservation. No later draw, announcement, or commitment carrier may concern a position at or below the existing watermark: `inv 22: seq X concerns slot/lane position P already disclosed through W`. (23) Derived values: for each draw at position `j ≤ through_position`, `p_j = chain_step^(k-j)(preimage)`, result per §2.11, degree per §2.14 — computed, never trusted. (24) For each `disclose`: `opened` is strictly ascending by `seq` with no duplicates; it contains exactly one element for every commitment-carrying entry (`draw`, `announce`, `dc-late`) of that slot and lane with `seq` before the disclose whose concerned position is ≤ `through_position` and that no earlier `disclose` opened — and no other elements; each element supplies exactly the fields its entry committed (`dc` ↔ `dc_commit`, `modifier` ↔ `mod_commit`, `context` ↔ `context_commit`) and no others; each commitment recomputes from the derived salt (§2.12) and the supplied value.
 
-**Final:** (25) If `final-reveal` exists: the session is closed; `SHA256(secret) == commitment`; the genesis configuration commitment and `E` recompute; every published tail and every consumed roll recomputes from the secret; every previously disclosed preimage matches; `labels` contains exactly one element per sealed activation (none for genesis-active slots), ascending by `slot`, and every `label_commit` recomputes from the derived `salt_label` (§2.8) and `canonical_json({display, role})`. (26) Only `closed` may follow `final-reveal`; `closed` requires final reveal and is the last entry.
+**Final:** (25) If `final-reveal` exists: the session is closed; the immediately preceding contiguous block contains any disclosures that exceed a consumed cursor; every created lane is disclosed through its highest concerned position and every earlier commitment carrier is opened; `SHA256(secret) == commitment`; the genesis configuration commitment and `E` recompute; every published tail and every consumed roll recomputes from the secret; every previously disclosed preimage matches; `labels` contains exactly one element per sealed activation (none for genesis-active slots), ascending by `slot`, and every `label_commit` recomputes from the derived `salt_label` (§2.8) and `canonical_json({display, role})`. (26) Only `closed` may follow `final-reveal`; `closed` requires final reveal and is the last entry.
 
 All entry kinds also have exact allowed-field schemas. Unknown top-level fields,
 malformed dates/timestamps, non-integer protocol numbers, impossible session
@@ -548,7 +559,7 @@ Numbered wizard, "the players are watching" framing, everything legible across a
 
 ### 4.3 Phase 2 — Play
 
-Per §7.3. Each session: `session-open`, draws, `session-close`, then **open-lane disclosure through the current position**, then export, publish, and post the digest (§7.7).
+Per §7.3. Each session follows `OPEN(n) → CLOSED_PENDING(n) → CLOSED_PUBLISHED(n)`: `session-open`, draws, `session-close`, then **open-lane disclosure through the highest consumed position**, export, publish, and post the digest (§7.7). Close, disclosure, and publication are one serialized ceremony. Before export the server persists an encrypted receipt containing the session, frozen range/head/digest, normalized late DCs, and completion state. Retries name the session and return that receipt without recounting or rerunning a completed mirror. While close is pending, only publication recovery and read-only/private UI state are allowed; a new session, activation, final reveal, or other ledger append is refused. Standalone publication is refused while a session or announcement is open. Between-session standalone publication uses the same write-ahead rule: its frozen range, head, and digest are encrypted before export, and any interrupted retry resumes that exact publication rather than replaying an older receipt or skipping the mirror.
 
 **Publish at session end, not during play.** Live publication would let a player watching the repo infer that a secret check just happened — the exact leak PF2e's secret-check rule exists to prevent.
 
@@ -701,7 +712,11 @@ the remote and its history cannot be quietly rewritten by the GM. A successful
 configured shell command proves neither fact; the UI therefore reports
 “command succeeded,” not “mirror confirmed.” Ledger timestamps are otherwise
 GM-machine-generated and trivially forgeable, so player-controlled chat heads
-remain the primary external anchors.
+remain the primary external anchors. The command receives the frozen head as
+`COLUMN_PUBLISH_HEAD` and MUST be idempotent for that head. Local receipt state
+is persisted before the command runs, but a crash after a successful remote
+effect and before the completion write can retry it; mirror execution is
+therefore at-least-once across crashes, not transactionally exactly-once.
 
 ### 6.7 Backups
 
@@ -765,15 +780,19 @@ Lists all slots: active (role, lanes, positions, retired state), pending activat
 ### 7.5 `/sheets` — modifiers
 
 Editable per-slot named profiles plus a per-check-type default-profile picker.
-Genesis bootstrapping creates a `Default` +0 profile for every active player
-and selects it for every check that player can make, so a new campaign is
-immediately drawable without silently omitting a modifier.
+Genesis bootstrapping creates a `Default` +0 profile for every active player,
+and successful later player activation does the same immediately after its
+`activate` entry. Every available check selects that profile, so every player
+is immediately drawable without silently omitting a modifier.
 Saving a **player** slot writes a public `sheet-update` with an
 `effective_from` date and the complete profile map, including for players
 activated later. Omitted names are deleted. Saving an **NPC or world** slot
 replaces its dateless private current-value map; the UI hides
-`effective_from`, and the API rejects it rather than ignoring it. Defaults are
-private convenience pointers, never copied values or ledger commitments. Each
+`effective_from`, and the API rejects it rather than ignoring it. The editor
+saves a snapshot and its defaults as one validated mutation; every default
+must name a profile applicable immediately, so a future-only snapshot cannot
+create a dangling private pointer. Defaults are private convenience pointers,
+never copied values or ledger commitments. Each
 private modifier actually used in a draw is committed and opens with that draw
 at disclosure/final reveal (§2.12); the private sheet and defaults themselves
 are not ledger artifacts.
@@ -802,9 +821,12 @@ Posting it gives the timestamps an externally-witnessed anchor and makes "felt l
 
 Session zero happens once, in front of five people, on software that has never been run in anger. Rehearsal mode writes to its own state directory against a throwaway secret, has an unmistakable persistent banner, and is **structurally unable to be promoted to the real ceremony** (the flag rides inside the authenticated ciphertext, so the files cannot be reopened as a real campaign).
 
-It **publishes into its own separate directory by default**, because the session-close wizard publishes and the player verifier reads a published artifact: a rehearsal that cannot publish cannot rehearse either of them, which is most of what a dress run is for. The development defaults isolate both state and publication from a real run, while explicitly configured directories are used exactly as supplied. A configured git mirror makes publishing a hard error, and the digest labels itself as a rehearsal, since the chat digest is the one artifact that travels without its context.
+It **publishes into its own separate directory by default**, because the session-close wizard publishes and the player verifier reads a published artifact: a rehearsal that cannot publish cannot rehearse either of them, which is most of what a dress run is for. The NixOS service runs as `column-rehearsal`, uses `/var/lib/column-rehearsal/{state,public}`, and cannot read the production tree, mirror credentials, or auto-unlock credential. Configured rehearsal paths may not overlap production paths. A configured git mirror makes publishing a hard error, and the digest labels itself as a rehearsal, since the chat digest is the one artifact that travels without its context.
 
-Delete that separate directory while the service is stopped when rehearsal is no longer needed. The same mode covers practice draws before session 1, which would otherwise burn real positions.
+Default-path rehearsal state is throwaway and is not migrated automatically.
+Delete that separate directory while the service is stopped when rehearsal is
+no longer needed. The same mode covers practice draws before session 1, which
+would otherwise burn real positions.
 
 ### 7.9 `/reveal` — the final ceremony
 

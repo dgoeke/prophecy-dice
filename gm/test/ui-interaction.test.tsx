@@ -160,6 +160,11 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     expect(input.selectionStart).toBe(0);
     expect(input.selectionEnd).toBe(2);
 
+    fireEvent.change(input, { target: { value: '12oops' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(document.body.textContent).toContain('DC must be an integer'));
+    expect(screen.getByLabelText('DC')).toBeTruthy();
+
     fireEvent.change(input, { target: { value: '12' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(screen.getByRole('button', { name: '12' })).toBeTruthy();
@@ -207,6 +212,7 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     await waitFor(() => expect(document.body.textContent).toContain('draws require an open session'));
     expect(draws()).toHaveLength(before);
     expect(screen.getByTitle('pending profile Occultism')).toBeTruthy();
+    await campaign.publish();
     await campaign.sessionOpen();
 
     // Re-arming a slot clears it.
@@ -254,6 +260,12 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     // no draw yet — the context sheet is up instead
     await screen.findByText(/RITUAL DRAW/);
     expect(draws()).toHaveLength(before);
+    const ritualDc = document.querySelector('.ceremony .dcchip input') as HTMLInputElement;
+    fireEvent.change(ritualDc, { target: { value: '17oops' } });
+    fireEvent.click(screen.getByText('Announce'));
+    await waitFor(() => expect(document.body.textContent).toContain('DC must be an integer'));
+    expect(campaign.ledgerJson().entries.at(-1).kind).not.toBe('announce');
+    fireEvent.change(ritualDc, { target: { value: '' } });
     // announce, then reveal
     fireEvent.click(screen.getByText('Announce'));
     await screen.findByText('ANNOUNCED');
@@ -369,8 +381,18 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     await screen.findByText(/RITUAL DRAW/);
     fireEvent.click(screen.getByText('Announce'));
     await screen.findByText('ANNOUNCED');
+    fireEvent.change(screen.getByLabelText('ritual DC'), { target: { value: '23' } });
+    fireEvent.click(screen.getByText('m — manual'));
+    fireEvent.change(screen.getByLabelText('ritual manual modifier'), { target: { value: '-4' } });
 
     const before = draws().length;
+    fireEvent.click(screen.getByText(/^Void/));
+    await screen.findByText('VOID');
+    fireEvent.click(screen.getByText('back'));
+    expect(await screen.findByText('ANNOUNCED')).toBeTruthy();
+    expect(screen.getByText('Selected Perception +5')).toBeTruthy();
+    expect((screen.getByLabelText('ritual DC') as HTMLInputElement).value).toBe('23');
+    expect((screen.getByLabelText('ritual manual modifier') as HTMLInputElement).value).toBe('-4');
     fireEvent.click(screen.getByText(/^Void/));
     await screen.findByText('VOID');
     fireEvent.click(screen.getByText('Write the void'));
@@ -447,7 +469,8 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
   it('re-enters a manual modifier after recovering an ANNOUNCED ritual', async () => {
     await waitFor(() => expect(document.querySelector('.overlay')).toBeNull());
     fireEvent.keyDown(window, { key: 'Escape' });
-    fireEvent.keyDown(window, { key: '1' });
+    const aliceCard = screen.getAllByText('Alice').find((element) => element.closest('.slotarm'))!;
+    fireEvent.click(aliceCard.closest('button')!);
     const chip = await screen.findByText('cosmology-major');
     fireEvent.keyDown(window, { key: chip.closest('button')!.querySelector('.keycap')!.textContent! });
     fireEvent.keyDown(window, { key: 'Enter' });
@@ -462,9 +485,10 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
 
     fireEvent.keyDown(overlay, { key: 'm' });
     const manual = await screen.findByLabelText('ritual manual modifier');
+    fireEvent.change(manual, { target: { value: 'not-an-integer' } });
+    expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(manual, { target: { value: '-3' } });
-    fireEvent.keyDown(manual, { key: 'Enter' });
-    expect(screen.getByText('Selected manual -3')).toBeTruthy();
+    expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(false);
 
     const before = draws().length;
     fireEvent.click(screen.getByText(/^Reveal/));
@@ -474,6 +498,73 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     expect(campaign.disclosePreview(recovered.slot, recovered.lane, recovered.position)
       .draws.find((draw: any) => draw.seq === recovered.seq)?.context).toContain('@mod manual');
     fireEvent.keyDown(document.querySelector('.overlay')!, { key: 'Enter' });
+  }, 20_000);
+
+  it('attributes correction redraws to an explicit target-scoped profile', async () => {
+    cleanup();
+    render(<App />);
+    await screen.findByText('Alice');
+    await waitFor(() => expect(document.querySelector('.overlay')).toBeNull());
+    const aliceCard = screen.getAllByText('Alice').find((element) => element.closest('.slotarm'))!;
+    fireEvent.click(aliceCard.closest('button')!);
+    const rk = await screen.findByText('rk-general');
+    fireEvent.click(rk.closest('button')!);
+    const beforeRoutine = draws().length;
+    fireEvent.keyDown(window, { key: 'Enter' });
+    await waitFor(() => expect(draws()).toHaveLength(beforeRoutine + 1));
+
+    fireEvent.keyDown(window, { key: 'U' });
+    await screen.findByText('Correct the last draw');
+    const target = screen.getByDisplayValue('— no redraw —') as HTMLSelectElement;
+    fireEvent.change(target, { target: { value: 'slot-02' } });
+    const profile = screen.getByLabelText('correction profile') as HTMLSelectElement;
+    fireEvent.change(profile, { target: { value: 'Occultism' } });
+    const before = draws().length;
+    fireEvent.click(screen.getByText('Write correction'));
+    await waitFor(() => expect(draws()).toHaveLength(before + 1));
+    const replacement = draws().at(-1);
+    expect(replacement.slot).toBe('slot-02');
+    expect(campaign.disclosePreview(replacement.slot, replacement.lane, replacement.position)
+      .draws.find((draw: any) => draw.seq === replacement.seq)?.context).toContain('@mod "Occultism"');
+  }, 20_000);
+
+  it('reuses one replacement draw after an ambiguous correction-draw response', async () => {
+    cleanup(); render(<App />);
+    await screen.findByText('Alice');
+    await waitFor(() => expect(document.querySelector('.overlay')).toBeNull());
+    const aliceCard = screen.getAllByText('Alice').find((element) => element.closest('.slotarm'))!;
+    fireEvent.click(aliceCard.closest('button')!);
+    fireEvent.click((await screen.findByText('rk-general')).closest('button')!);
+    const beforeOriginal = draws().length;
+    fireEvent.keyDown(window, { key: 'Enter' });
+    await waitFor(() => expect(draws()).toHaveLength(beforeOriginal + 1));
+
+    fireEvent.keyDown(window, { key: 'U' });
+    await screen.findByText('Correct the last draw');
+    fireEvent.change(screen.getByDisplayValue('— no redraw —'), { target: { value: 'slot-02' } });
+    fireEvent.change(screen.getByLabelText('correction profile'), { target: { value: 'Occultism' } });
+
+    const originalFetch = globalThis.fetch;
+    let dropDrawResponse = true;
+    globalThis.fetch = async (input, init) => {
+      const response = await originalFetch(input, init);
+      if (dropDrawResponse && String(input).endsWith('/api/draw') && init?.method === 'POST') {
+        dropDrawResponse = false;
+        throw new TypeError('simulated lost draw response');
+      }
+      return response;
+    };
+    try {
+      const before = draws().length;
+      fireEvent.click(screen.getByText('Write correction'));
+      await waitFor(() => expect(draws()).toHaveLength(before + 1));
+      expect(await screen.findByText('Correct the last draw')).toBeTruthy();
+      fireEvent.click(screen.getByText('Write correction'));
+      await waitFor(() => expect(document.querySelector('.overlay')).toBeNull());
+      expect(draws()).toHaveLength(before + 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   }, 20_000);
 
   it('/sheets saves complete named snapshots, defaults, and dateless NPC maps', async () => {
@@ -495,27 +586,43 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     });
     await waitFor(() => expect(within(alicePane).getByText('Save profiles & defaults')).toBeTruthy());
 
-    // A future snapshot remains editable after reload even though /table
-    // continues to use the currently effective snapshot for draws.
+    // A future-only rename cannot also become an immediate private default:
+    // the combined endpoint rejects both halves, leaving no dangling pointer.
     fireEvent.change(within(alicePane).getByLabelText('profile 2 name'), { target: { value: 'Esoterica' } });
     fireEvent.change(within(alicePane).getByLabelText('effective from'), { target: { value: '2099-01-02' } });
+    const beforeFutureRefusal = campaign.ledgerJson().entries
+      .filter((entry: any) => entry.kind === 'sheet-update').length;
     fireEvent.click(within(alicePane).getByText('Save profiles & defaults'));
-    await waitFor(() => {
-      expect(campaign.ledgerJson().entries
-        .filter((entry: any) => entry.kind === 'sheet-update' && entry.slot === 'slot-01').at(-1))
-        .toMatchObject({ effective_from: '2099-01-02', modifiers: { Civics: 11, Esoterica: 4 } });
-      expect(campaign.tableState().sheets['slot-01']).toEqual({ Civics: 11, Occultism: 4 });
-      expect(campaign.tableState().profile_defaults['slot-01']['cosmology-major']).toBe('Esoterica');
-    });
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('is not available'));
+    expect(campaign.ledgerJson().entries.filter((entry: any) => entry.kind === 'sheet-update'))
+      .toHaveLength(beforeFutureRefusal);
+    expect(campaign.tableState().profile_defaults['slot-01']['cosmology-major']).toBe('Occultism');
+    await waitFor(() => expect(within(alicePane).getByText('Save profiles & defaults')).toBeTruthy());
+
+    // Scheduling values under names that already exist now is safe. A reload
+    // edits the currently applicable sheet and reports the separate schedule.
+    fireEvent.change(within(alicePane).getByLabelText('profile 2 name'), { target: { value: 'Occultism' } });
+    fireEvent.change(within(alicePane).getByLabelText('Occultism modifier'), { target: { value: '8' } });
+    fireEvent.click(within(alicePane).getByText('Save profiles & defaults'));
+    await waitFor(() => expect(campaign.ledgerJson().entries
+      .filter((entry: any) => entry.kind === 'sheet-update' && entry.slot === 'slot-01').at(-1))
+      .toMatchObject({ effective_from: '2099-01-02', modifiers: { Civics: 11, Occultism: 8 } }));
+    expect(campaign.tableState().sheets['slot-01']).toEqual({ Civics: 11, Occultism: 4 });
+    await waitFor(() => expect(
+      (within(alicePane).getByLabelText('effective from') as HTMLInputElement).value,
+    ).toBe(today));
+    expect((within(alicePane).getByLabelText('Occultism modifier') as HTMLInputElement).value).toBe('4');
 
     cleanup();
     render(<App />);
     fireEvent.click(await screen.findByText('sheets'));
     const reloadedAlice = (await screen.findByRole('heading', { name: /Alice/ })).closest('.pane') as HTMLElement;
-    expect((within(reloadedAlice).getByLabelText('profile 2 name') as HTMLInputElement).value).toBe('Esoterica');
-    expect((within(reloadedAlice).getByLabelText('effective from') as HTMLInputElement).value).toBe('2099-01-02');
+    expect((within(reloadedAlice).getByLabelText('profile 2 name') as HTMLInputElement).value).toBe('Occultism');
+    expect((within(reloadedAlice).getByLabelText('Occultism modifier') as HTMLInputElement).value).toBe('4');
+    expect((within(reloadedAlice).getByLabelText('effective from') as HTMLInputElement).value).toBe(today);
     expect((within(reloadedAlice).getByLabelText('cosmology-major') as HTMLSelectElement).selectedOptions[0].textContent)
-      .toBe('Esoterica');
+      .toBe('Occultism');
+    expect(within(reloadedAlice).getByText(/separate snapshot is scheduled for 2099-01-02/)).toBeTruthy();
 
     const beforeNoop = campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update').length;
     fireEvent.click(within(reloadedAlice).getByText('Save profiles & defaults'));
@@ -524,25 +631,26 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update')).toHaveLength(beforeNoop);
 
     fireEvent.click(within(reloadedAlice).getByRole('button', { name: 'delete Civics' }));
-    fireEvent.click(within(reloadedAlice).getByRole('button', { name: 'delete Esoterica' }));
+    fireEvent.click(within(reloadedAlice).getByRole('button', { name: 'delete Occultism' }));
     fireEvent.click(within(reloadedAlice).getByText('Save profiles & defaults'));
     expect(screen.getByRole('status').textContent).toContain('public profile snapshot cannot be empty');
     expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update')).toHaveLength(beforeNoop);
 
-    // Private defaults are written first. If the permanent snapshot is
-    // refused, retrying after correction appends exactly one public entry.
+    // Invalid input rejects the combined save without changing either side;
+    // retrying after correction appends exactly one public entry.
     const bobPane = (await screen.findByRole('heading', { name: /Bob/ })).closest('.pane') as HTMLElement;
+    const bobDefaults = { ...campaign.tableState().profile_defaults['slot-02'] };
     fireEvent.change(within(bobPane).getByLabelText('profile 1 name'), { target: { value: 'Diplomacy' } });
     fireEvent.change(within(bobPane).getByLabelText('effective from'), { target: { value: '' } });
     const beforeRefusal = campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update').length;
     fireEvent.click(within(bobPane).getByText('Save profiles & defaults'));
     await waitFor(() => expect(screen.getByRole('status').textContent)
-      .toContain('defaults saved privately, but the profile snapshot failed'));
-    expect(campaign.tableState().profile_defaults['slot-02']['rk-general']).toBe('Diplomacy');
+      .toContain('effective_from must be a real'));
+    expect(campaign.tableState().profile_defaults['slot-02']).toEqual(bobDefaults);
     expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update')).toHaveLength(beforeRefusal);
     await waitFor(() => expect(within(bobPane).getByText('Save profiles & defaults')).toBeTruthy());
 
-    fireEvent.change(within(bobPane).getByLabelText('effective from'), { target: { value: '2099-01-03' } });
+    fireEvent.change(within(bobPane).getByLabelText('effective from'), { target: { value: today } });
     fireEvent.click(within(bobPane).getByText('Save profiles & defaults'));
     await waitFor(() => expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update'))
       .toHaveLength(beforeRefusal + 1));

@@ -24,8 +24,9 @@ export function Disclose() {
 
   const doPreview = async (key: string) => {
     const [slot, lane] = key.split('/');
-    const through = parseInt(targets[key] ?? '', 10);
-    if (!Number.isFinite(through)) return setMsg('pick a target position');
+    const raw = (targets[key] ?? '').trim();
+    const through = Number(raw);
+    if (raw === '' || !Number.isInteger(through)) return setMsg('pick an integer target position');
     try { setPreview({ ...(await api('/api/disclose/preview', { slot, lane, through_position: through })), key }); setMsg(null); }
     catch (e: any) { setMsg(e.message); }
   };

@@ -17,6 +17,9 @@ self: { config, lib, pkgs, ... }:
 let
   cfg = config.services.column;
   inherit (lib) mkEnableOption mkIf mkMerge mkOption types optionalAttrs;
+  within = child: parent: let c = toString child; p = toString parent;
+    in c == p || lib.hasPrefix "${p}/" c;
+  overlaps = a: b: within a b || within b a;
 in
 {
   options.services.column = {
@@ -53,13 +56,16 @@ in
       gitMirrorCommand = mkOption {
         type = types.nullOr types.str;
         default = null;
-        example = "git add ledger.json && git commit -m publish && git push";
+        example = ''git add ledger.json && (git diff --cached --quiet || git commit -m "publish $COLUMN_PUBLISH_HEAD") && git push'';
         description = ''
           Run in publicDir after each publish. A remote commit history is an
           independent witness only if players can see it and the GM cannot
           quietly rewrite it. Command success is reported, but the
           application cannot prove that the command actually pushed. Failure
-          never blocks the local publish.
+          never blocks the local publish. The command receives the frozen
+          head as COLUMN_PUBLISH_HEAD and must be idempotent for that head:
+          after a process crash, an attempt whose outcome was not durably
+          recorded may run again.
         '';
       };
       autoUnlock = {
@@ -74,9 +80,9 @@ in
           '';
         };
         passphraseFile = mkOption {
-          type = types.nullOr types.path;
+          type = types.nullOr types.str;
           default = null;
-          description = "File containing the passphrase (e.g. an agenix/sops-nix secret path).";
+          description = "Absolute runtime path containing the passphrase (e.g. an agenix/sops-nix secret path). Injected with systemd LoadCredential.";
         };
       };
     };
@@ -97,12 +103,12 @@ in
       port = mkOption { type = types.port; default = 7778; };
       stateDir = mkOption {
         type = types.path;
-        default = "/var/lib/column/rehearsal";
+        default = "/var/lib/column-rehearsal/state";
         description = "Throwaway rehearsal state. Mode 0700.";
       };
       publicDir = mkOption {
         type = types.path;
-        default = "/var/lib/column/rehearsal-public";
+        default = "/var/lib/column-rehearsal/public";
         description = "Published rehearsal artifacts, kept separate from the real ledger.";
       };
       drandEndpoint = mkOption { type = types.str; default = "https://api.drand.sh"; };
@@ -130,7 +136,11 @@ in
   };
 
   config = mkMerge [
-    (mkIf (cfg.gm.enable || cfg.rehearsal.enable) {
+    (mkIf cfg.gm.enable {
+      assertions = lib.optional (cfg.gm.autoUnlock.passphraseFile != null) {
+        assertion = lib.hasPrefix "/" cfg.gm.autoUnlock.passphraseFile;
+        message = "services.column.gm.autoUnlock.passphraseFile must be an absolute runtime path";
+      };
       users.users.column = { isSystemUser = true; group = "column"; };
       users.groups.column = { };
       # the shared parent is 0755 so a separate static server (caddy) can
@@ -139,9 +149,24 @@ in
     })
 
     (mkIf cfg.rehearsal.enable {
+      assertions = [
+        {
+          assertion = !(overlaps cfg.rehearsal.stateDir cfg.rehearsal.publicDir)
+            && !(overlaps cfg.rehearsal.stateDir cfg.gm.stateDir)
+            && !(overlaps cfg.rehearsal.stateDir cfg.gm.publicDir)
+            && !(overlaps cfg.rehearsal.publicDir cfg.gm.stateDir)
+            && !(overlaps cfg.rehearsal.publicDir cfg.gm.publicDir)
+            && !(within cfg.rehearsal.stateDir "/var/lib/column")
+            && !(within cfg.rehearsal.publicDir "/var/lib/column");
+          message = "Prophecy Dice rehearsal paths must not overlap or live beneath production /var/lib/column paths.";
+        }
+      ];
+      users.users.column-rehearsal = { isSystemUser = true; group = "column-rehearsal"; };
+      users.groups.column-rehearsal = { };
       systemd.tmpfiles.rules = [
-        "d ${cfg.rehearsal.stateDir} 0700 column column -"
-        "d ${cfg.rehearsal.publicDir} 0755 column column -"
+        "d /var/lib/column-rehearsal 0755 column-rehearsal column-rehearsal -"
+        "d ${cfg.rehearsal.stateDir} 0700 column-rehearsal column-rehearsal -"
+        "d ${cfg.rehearsal.publicDir} 0755 column-rehearsal column-rehearsal -"
       ];
 
       systemd.services.column-rehearsal = {
@@ -163,8 +188,8 @@ in
         };
         serviceConfig = {
           ExecStart = "${cfg.rehearsal.package}/bin/column-gm";
-          User = "column";
-          Group = "column";
+          User = "column-rehearsal";
+          Group = "column-rehearsal";
           Restart = "on-failure";
           UMask = "0077";
           ProtectSystem = "strict";
@@ -173,9 +198,10 @@ in
           NoNewPrivileges = true;
           RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
           ReadWritePaths = [ cfg.rehearsal.stateDir cfg.rehearsal.publicDir ];
-          # Rehearsal must not be able to read or overwrite the real secrets,
-          # even though both services use the dedicated `column` Unix user.
-          InaccessiblePaths = [ "-${cfg.gm.stateDir}" ];
+          # Hide the entire production tree (including mirror SSH material),
+          # any custom production paths, and the configured unlock secret.
+          InaccessiblePaths = [ "-/var/lib/column" "-${cfg.gm.stateDir}" "-${cfg.gm.publicDir}" ]
+            ++ lib.optional (cfg.gm.autoUnlock.passphraseFile != null) "-${cfg.gm.autoUnlock.passphraseFile}";
           CapabilityBoundingSet = "";
           LockPersonality = true;
           ProtectKernelTunables = true;
@@ -239,13 +265,16 @@ in
           ProtectControlGroups = true;
           RestrictNamespaces = true;
           SystemCallArchitectures = "native";
+        } // optionalAttrs (cfg.gm.autoUnlock.enable && cfg.gm.autoUnlock.passphraseFile != null) {
+          LoadCredential = "column-passphrase:${cfg.gm.autoUnlock.passphraseFile}";
         };
         # off by default; see the option warning (§6.4)
         postStart = mkIf (cfg.gm.autoUnlock.enable && cfg.gm.autoUnlock.passphraseFile != null) ''
           sleep 2
-          ${pkgs.curl}/bin/curl -sf -X POST \
+          ${pkgs.jq}/bin/jq -Rn --rawfile pass "''${CREDENTIALS_DIRECTORY}/column-passphrase" \
+            '{passphrase: $pass}' | ${pkgs.curl}/bin/curl -sf -X POST \
             -H 'Content-Type: application/json' \
-            --data "{\"passphrase\": $(${pkgs.jq}/bin/jq -Rs . < ${cfg.gm.autoUnlock.passphraseFile})}" \
+            --data-binary @- \
             "http://${cfg.gm.bindAddress}:${toString cfg.gm.port}/api/unlock" > /dev/null
         '';
       };

@@ -99,6 +99,7 @@ export function createServer(campaign: Campaign, opts: { idleLockMs?: number; no
     'POST /api/setup/genesis': (b) => campaign.genesis(b),
     'POST /api/session/open': () => campaign.sessionOpen(),
     'POST /api/session/close': () => campaign.sessionClose(),
+    'POST /api/session/close-and-publish': (b) => campaign.closeAndPublish(b),
     'POST /api/draw': (b) => campaign.draw(b),
     'POST /api/batch': (b) => campaign.batch(b),
     'POST /api/announce': (b) => campaign.announce(b),
@@ -106,8 +107,11 @@ export function createServer(campaign: Campaign, opts: { idleLockMs?: number; no
     'POST /api/correction': (b) => campaign.correction(b),
     'POST /api/dc-late': (b) => campaign.dcLate(b),
     'POST /api/out-of-band': (b) => campaign.outOfBand(b),
-    'POST /api/sheet-update': (b) => campaign.sheetUpdate(b),
+    // Compatibility route: preserve and validate the slot's current defaults
+    // through the same atomic operation used by the /sheets editor.
+    'POST /api/sheet-update': (b) => campaign.saveProfiles(b),
     'POST /api/profile-defaults': (b) => campaign.profileDefaults(b),
+    'POST /api/profiles/save': (b) => campaign.saveProfiles(b),
     'POST /api/retire-slot': (b) => campaign.retireSlot(b),
     'POST /api/note': (b) => campaign.note(b.text),
     'POST /api/activation/declare': (b) => campaign.activationDeclare(b),
@@ -144,7 +148,8 @@ export function createServer(campaign: Campaign, opts: { idleLockMs?: number; no
           ? { ...status, clients: sseClients.size }
           : {
               phase: status.phase, locked: true, rehearsal: status.rehearsal,
-              campaign: null, session: 0, session_open: false, entries: 0,
+              campaign: null, session: 0, session_open: false, close_pending: false,
+              close_pending_session: null, entries: 0,
               unpublished: null, pending_activation: null, clients: 0,
               precommit: null, configuration_frozen: false,
             });

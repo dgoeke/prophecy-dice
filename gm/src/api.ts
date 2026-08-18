@@ -37,6 +37,9 @@ export interface Status {
   rehearsal: boolean;
   campaign: string | null;
   session: number;
+  session_open: boolean;
+  close_pending: boolean;
+  close_pending_session: number | null;
   entries: number;
   unpublished: number | null;
   precommit?: { commitment: string; precommit_at: string } | null;
@@ -63,6 +66,12 @@ export interface TableState {
   session: number;
   lanes: Record<string, { drawn: number; remaining: number; watermark: number }>;
   sheets: Record<string, Record<string, number>>;
+  latest_sheets: Record<string, {
+    seq: number; slot: string; effective_from: string; modifiers: Record<string, number>;
+  }>;
+  scheduled_sheets: Record<string, {
+    seq: number; slot: string; effective_from: string; modifiers: Record<string, number>;
+  }[]>;
   npc_sheets: Record<string, Record<string, number>>;
   profile_defaults: Record<string, Record<string, string>>;
   open_announce: null | {

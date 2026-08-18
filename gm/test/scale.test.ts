@@ -78,6 +78,12 @@ function buildScaleLedger() {
     for (const lane of s.lanes!) tails[s.id][lane] = links.get(`${s.id}/${lane}`)![N].toString('hex');
   }
   append({ kind: 'genesis', transcript, tails });
+  for (const slot of players) {
+    append({
+      kind: 'sheet-update', slot, effective_from: '2026-08-14',
+      modifiers: { 'rk-general': 5, 'public-gm-check': 4 },
+    });
+  }
 
   const draw = (slot: string, typeId: string, lane: string,
     o: { mod?: number; sealMod?: number; dc?: number; sealDc?: number }) => {
@@ -126,6 +132,15 @@ function buildScaleLedger() {
     session = s;
     append({ kind: 'session-open' });
     for (let d = 0; d < DRAWS_PER_SESSION; d++) {
+      // Exercise the advisory lookup at archival scale instead of timing only
+      // ledgers with no sheet history (the regression that prompted this).
+      if (d % 10 === 0) {
+        append({
+          kind: 'sheet-update', slot: players[(s + d) % players.length],
+          effective_from: '2026-08-14',
+          modifiers: { 'rk-general': 5, 'public-gm-check': 4 },
+        });
+      }
       const slot = active[d % active.length];
       if (players.includes(slot)) {
         if (d % 3 === 2) draw(slot, 'public-gm-check', 'open', { mod: 4, dc: 12 + (d % 8) });
@@ -180,6 +195,8 @@ describe('scale (§12.12)', () => {
     const activeCount = ledger.entries[0].transcript.slots.filter((s: any) => s.status === 'active').length
       + ledger.entries.filter((e: any) => e.kind === 'activate').length;
     expect(activeCount).toBe(20);
+    expect(ledger.entries.filter((entry: any) => entry.kind === 'sheet-update').length)
+      .toBeGreaterThanOrEqual(1000);
     console.log(`built ${ledger.entries.length} entries in ${buildS.toFixed(1)}s`);
   });
 
