@@ -300,9 +300,30 @@ const FORBIDDEN_PROFILE_NAMES = new Set([
   'hasOwnProperty', '__lookupGetter__', '__lookupSetter__', 'isPrototypeOf',
   'propertyIsEnumerable', 'toString', 'valueOf', '__proto__', 'toLocaleString',
 ]);
+const hasUnpairedSurrogate = value => [...value].some(character => {
+  const code = character.charCodeAt(0);
+  return character.length === 1 && code >= 0xd800 && code <= 0xdfff;
+});
 const validProfileName = v => typeof v === 'string' && v === v.trim()
   && [...v].length >= 1 && [...v].length <= 64
-  && !PROFILE_CONTROL_RE.test(v) && !FORBIDDEN_PROFILE_NAMES.has(v);
+  && !PROFILE_CONTROL_RE.test(v) && !hasUnpairedSurrogate(v) && !FORBIDDEN_PROFILE_NAMES.has(v);
+function parseModDirective(context) {
+  const lines = context.split(/\r\n|[\r\n\u2028\u2029]/u);
+  const directives = lines.map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^@mod(?:\s|$)/u.test(line));
+  if (!directives.length) return { kind: 'legacy' };
+  if (directives.length !== 1 || directives[0].index !== lines.length - 1) return { kind: 'malformed' };
+  const line = directives[0].line;
+  if (line === '@mod manual') return { kind: 'manual' };
+  if (!line.startsWith('@mod ')) return { kind: 'malformed' };
+  const encoded = line.slice(5);
+  try {
+    const name = JSON.parse(encoded);
+    if (typeof name === 'string' && validProfileName(name) && JSON.stringify(name) === encoded)
+      return { kind: 'profile', name };
+  } catch { /* advisory parser: malformed input is classified below */ }
+  return { kind: 'malformed' };
+}
 const KNOWN_CHAINS = {
   'drand:8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce': { genesis_time: 1595431050, period: 30 },
   'drand:52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971': { genesis_time: 1692803367, period: 3 },
@@ -344,6 +365,71 @@ const validDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
   && new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) === v;
 const tick = () => new Promise(r => setTimeout(r, 0));
 
+function modifierCrossChecks(entries, slots, opened) {
+  const checks = [], advisories = [];
+  const sheets = entries.filter(e => e?.kind === 'sheet-update' && isInt(e.seq)
+    && typeof e.slot === 'string' && validDate(e.effective_from)
+    && e.modifiers && typeof e.modifiers === 'object' && !Array.isArray(e.modifiers));
+  const sheetSlots = new Set(sheets.map(e => e.slot));
+  for (const draw of entries) {
+    if (draw?.kind !== 'draw' || !isInt(draw.seq)
+        || typeof draw.slot !== 'string' || typeof draw.check_type !== 'string') continue;
+    const openedValues = opened.get(draw.seq) ?? {};
+    const modifier = isInt(draw.modifier) ? draw.modifier
+      : isInt(openedValues.modifier) ? openedValues.modifier : null;
+    const date = typeof draw.ts === 'string' ? draw.ts.slice(0, 10) : '';
+    const applicable = sheets.filter(sheet => sheet.slot === draw.slot
+      && sheet.seq < draw.seq && sheet.effective_from <= date)
+      .sort((a, b) => a.effective_from < b.effective_from ? -1
+        : a.effective_from > b.effective_from ? 1 : a.seq - b.seq).at(-1);
+    const isPlayer = slots.get(draw.slot)?.role === 'player' || sheetSlots.has(draw.slot);
+    let parsed;
+    if (typeof draw.context === 'string') parsed = parseModDirective(draw.context);
+    else if (typeof openedValues.context === 'string') parsed = parseModDirective(openedValues.context);
+    else if ('context_commit' in draw) parsed = { kind: 'sealed' };
+    else if ('context' in draw || 'context' in openedValues) parsed = { kind: 'malformed' };
+    else parsed = { kind: 'legacy' };
+
+    const attribution = parsed.kind, profile = parsed.name ?? null;
+    let sheetModifier = null, status;
+    if (attribution === 'sealed') status = 'sealed';
+    else if (attribution === 'manual') status = 'manual_override';
+    else if (attribution === 'malformed') {
+      status = 'malformed';
+      advisories.push(`modifier: seq ${draw.seq} malformed or multiple @mod directive`);
+    } else if (attribution === 'legacy') {
+      advisories.push(`modifier: seq ${draw.seq} legacy/unattributed context`);
+      const fallback = applicable?.modifiers?.[draw.check_type];
+      if (isInt(fallback)) {
+        sheetModifier = fallback;
+        if (modifier === null) status = 'sealed';
+        else if (modifier === fallback) status = 'match';
+        else {
+          status = 'mismatch';
+          advisories.push(`modifier: seq ${draw.seq} published modifier ${modifier} differs from legacy ${draw.check_type} value ${fallback}`);
+        }
+      } else status = 'legacy';
+    } else {
+      const saved = applicable?.modifiers?.[profile];
+      if (!isInt(saved)) {
+        status = 'unavailable';
+        if (isPlayer) advisories.push(`modifier: seq ${draw.seq} no applicable sheet value for profile ${JSON.stringify(profile)}`);
+      } else {
+        sheetModifier = saved;
+        if (modifier === null) status = 'sealed';
+        else if (modifier === saved) status = 'match';
+        else {
+          status = 'mismatch';
+          advisories.push(`modifier: seq ${draw.seq} published modifier ${modifier} differs from profile ${JSON.stringify(profile)} value ${saved}`);
+        }
+      }
+    }
+    checks.push({ seq: draw.seq, slot: draw.slot, check_type: draw.check_type, date, modifier,
+      attribution, profile, sheet_modifier: sheetModifier, status });
+  }
+  return { modifier_checks: checks, advisories };
+}
+
 async function verifyLedger(file, progress) {
   const F = [], fail = m => F.push(m), rolls = {};
   const M = { // model for rendering: everything the report sections need
@@ -352,7 +438,8 @@ async function verifyLedger(file, progress) {
     opened: new Map(), dcLateOf: new Map(), pairs: [], labels: [], remainder: new Map(),
     neverActivated: [], slots: new Map(), transcript: null, lastTs: null, S: null,
   };
-  const res = { verdict: 'FAILED', state: 'sealed', failures: F, entries: 0, rolls, model: M, incomplete: false };
+  const res = { verdict: 'FAILED', state: 'sealed', failures: F, entries: 0, rolls,
+    modifier_checks: [], advisories: [], model: M, incomplete: false };
   if (!file || typeof file !== 'object' || !Array.isArray(file.entries)) {
     fail('structure: not a ledger file'); res.incomplete = true; return res;
   }
@@ -866,6 +953,8 @@ async function verifyLedger(file, progress) {
   for (const [k, c] of cursor) M.perLane.set(k, { draws: c, max: maxConc.get(k) ?? c, watermark: watermark.get(k) ?? 0 });
   for (const [k, mc] of maxConc) if (!M.perLane.has(k)) M.perLane.set(k, { draws: cursor.get(k) ?? 0, max: mc, watermark: watermark.get(k) ?? 0 });
   M.drawRecs = drawRecs; M.registry = registry; M.finalReveal = finalReveal;
+  const advisory = modifierCrossChecks(entries, slots, M.opened);
+  res.modifier_checks = advisory.modifier_checks; res.advisories = advisory.advisories;
   res.state = finalReveal !== null ? 'fully revealed' : sawDisclose ? 'partially disclosed' : 'sealed';
   res.verdict = F.length ? 'FAILED' : 'VERIFIED';
   return res;
@@ -1021,17 +1110,30 @@ function render(res) {
   }
 
   // modifier cross-check (§8.4)
-  R.append(h('h2', {}, 'Modifier cross-check'), h('p', { class: 'mut' }, 'Published modifiers vs sheet-update history. Disagreements are advisory; check against your actual sheet.'));
-  const mc = h('table', {}, h('thead', {}, h('tr', {}, ['slot', 'check type', 'date', 'draw mod', 'sheet mod', ''].map(x => h('th', {}, x)))));
-  for (const [seq, d] of M.drawRecs ?? []) {
-    const e = d.entry;
-    if (typeof e.modifier !== 'number') continue;
-    const date = e.ts.slice(0, 10);
-    const sheet = M.sheets.filter(s => s.slot === d.slot && s.effective_from <= date).pop();
-    const sv = sheet?.modifiers?.[d.checkType];
-    const ok = sv === undefined || sv === e.modifier;
-    mc.append(h('tr', {}, h('td', {}, d.slot), h('td', {}, d.checkType), h('td', {}, date), h('td', {}, e.modifier),
-      h('td', {}, sv ?? '—'), h('td', { class: ok ? 'ok' : 'warn' }, ok ? '✓' : 'differs (advisory)')));
+  R.append(h('h2', {}, 'Modifier cross-check'), h('p', { class: 'mut' },
+    'Draw modifiers attributed by the final @mod context line and compared with the complete player snapshot in force at that draw. All notes here are advisory.'));
+  const mc = h('table', {}, h('thead', {}, h('tr', {},
+    ['seq', 'slot', 'check type', 'date', 'attribution', 'draw mod', 'sheet mod', ''].map(x => h('th', {}, x)))));
+  for (const c of res.modifier_checks) {
+    const attr = c.attribution === 'profile' ? c.profile
+      : c.attribution === 'manual' ? 'manual override'
+      : c.attribution === 'legacy' ? 'legacy / unattributed'
+      : c.attribution === 'malformed' ? 'malformed @mod'
+      : 'sealed';
+    const nonPlayer = M.slots.get(c.slot)?.role && M.slots.get(c.slot).role !== 'player';
+    let note, cls = 'mut';
+    if (c.status === 'match') { note = c.attribution === 'legacy' ? '✓ legacy fallback' : '✓'; cls = 'ok'; }
+    else if (c.status === 'mismatch') { note = 'differs (advisory)'; cls = 'warn'; }
+    else if (c.status === 'manual_override') note = 'deliberate override';
+    else if (c.status === 'legacy') { note = 'legacy / unattributed'; cls = 'warn'; }
+    else if (c.status === 'malformed') { note = 'malformed directive (advisory)'; cls = 'warn'; }
+    else if (c.status === 'unavailable') {
+      note = nonPlayer ? 'private sheet; not cross-checkable' : 'no applicable profile value (advisory)';
+      cls = nonPlayer ? 'mut' : 'warn';
+    } else note = 'sealed';
+    mc.append(h('tr', {}, h('td', {}, c.seq), h('td', {}, c.slot), h('td', {}, c.check_type),
+      h('td', {}, c.date), h('td', {}, attr ?? '—'), h('td', {}, c.modifier ?? '—'),
+      h('td', {}, c.sheet_modifier ?? '—'), h('td', { class: cls }, note)));
   }
   R.append(mc);
 
@@ -1079,7 +1181,7 @@ async function selfTest() {
     if (hex(ref) !== hex(sha256(utf8('column')))) throw Error('WebCrypto cross-check failed');
   }
 }
-globalThis.__column = { verifyLedger, canonical, sha256: b => hex(sha256(b)), rollFromPreimage, degreeOf, selfTest, chiSquare, runsTest, render: (...a) => render(...a) };
+globalThis.__column = { verifyLedger, parseModDirective, canonical, sha256: b => hex(sha256(b)), rollFromPreimage, degreeOf, selfTest, chiSquare, runsTest, render: (...a) => render(...a) };
 
 if (globalThis.document) {
   const status = m => { document.getElementById('status').textContent = m; };

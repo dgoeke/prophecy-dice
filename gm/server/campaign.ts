@@ -283,7 +283,7 @@ export class Campaign {
     const transcript = {
       version: 'wotw-column/1', commitment: C.commitmentOf(S),
       chain_length: input.chain_length ?? 20000, created_at: createdAt,
-      campaign: input.campaign, context_privacy: input.context_privacy ?? 'plain',
+      campaign: input.campaign, context_privacy: input.context_privacy ?? 'sealed',
       disclosure_policy: input.disclosure_policy, check_types: input.check_types,
       slots, beacon: null,
     };

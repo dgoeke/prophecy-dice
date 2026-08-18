@@ -155,22 +155,25 @@ server has no mutation route and verifiers reject `check-type` entries.
 
 Entries are **check types, not skills.** PF2e's secret trait does not partition by skill: Recall Knowledge, Sense Motive, Decipher Writing, and Identify Magic carry it; Perception against undetected creatures is secret by GM judgement; and the same skill can split by action — recalling hidden information may be sealed while identifying an object everyone can inspect may be open.
 
-Suggested starting registry (GM edits at ceremony):
+Suggested starting registry, in presentation/hotkey order (GM edits at ceremony):
 
-| id | lane | roles | seal_dc | seal_mod | ritual |
-|---|---|---|---|---|---|
-| `research-major` | sealed | player | ✓ | — | **✓** |
-| `lore-major` | sealed | player | ✓ | — | **✓** |
-| `investigation-major` | sealed | player | ✓ | — | **✓** |
-| `rk-general` | sealed | player | ✓ | — | — |
-| `perception-secret` | sealed | player | ✓ | — | — |
-| `sense-motive` | sealed | player | ✓ | — | — |
-| `decipher-identify` | sealed | player | ✓ | — | — |
-| `npc-public` | open | npc | — | ✓ | — |
-| `npc-secret` | deep | npc | ✓ | ✓ | — |
-| `world-routine` | routine | world | ✓ | ✓ | — |
-| `world-major` | deep | world | ✓ | ✓ | **✓** |
-| `public-gm-check` | open | player, npc, world | — | — | — |
+| id | label | lane | roles | seal_dc | seal_mod | ritual |
+|---|---|---|---|---|---|---|
+| `cosmology-major` | Major cosmology inquiry | sealed | player | ✓ | — | **✓** |
+| `research-major` | Major research check | sealed | player | ✓ | — | **✓** |
+| `investigation-major` | Major investigation check | sealed | player | ✓ | — | **✓** |
+| `rk-general` | Recall Knowledge | sealed | player | ✓ | — | — |
+| `lore-roots` | Recall Knowledge — roots Lore | sealed | player | ✓ | — | — |
+| `perception-secret` | Secret Perception | sealed | player | ✓ | — | — |
+| `sense-motive` | Sense Motive | sealed | player | ✓ | — | — |
+| `decipher-identify` | Decipher / Identify | sealed | player | ✓ | — | — |
+| `gather-information` | Gather Information | sealed | player | ✓ | — | — |
+| `secret-skill-other` | Other secret skill check | sealed | player | ✓ | — | — |
+| `npc-secret` | NPC secret check | deep | npc | ✓ | ✓ | — |
+| `npc-public` | NPC check the table watched | open | npc | — | ✓ | — |
+| `world-routine` | World — routine | routine | world | ✓ | ✓ | — |
+| `world-major` | World — major | deep | world | ✓ | ✓ | **✓** |
+| `public-gm-check` | Public GM check | open | player, npc, world | — | — | — |
 
 ### 2.6 The transcript
 
@@ -183,7 +186,7 @@ Fixed at the end of session zero:
   "chain_length": 20000,
   "created_at": "2026-08-14T19:32:11Z",
   "campaign": "Example Campaign",
-  "context_privacy": "plain",
+  "context_privacy": "sealed",
   "disclosure_policy": "Sealed and deep lanes: opened after a table-agreed delay. Open lane: opened at each session-close. Routine lane: opened every few sessions. Full reveal at campaign end.",
   "configuration_commitment": "<hex 64>",
   "check_types": [ … ],
@@ -207,7 +210,7 @@ Rules:
 - `slots` ordered by `id` ascending, `slot-NN` zero-padded, contiguous from `slot-01`.
 - `status` ∈ `active` (fully specified now) | `deferred` (reserved; role, lanes, display, and nonce all supplied at activation).
 - **Reserve generously. Default: 64 slots**, 6 active: five players plus the world. Slots cost a few kilobytes of transcript and milliseconds of derivation; exhaustion is a real operational failure and reservation is nearly free.
-- `context_privacy` ∈ `plain` | `sealed`. Default `plain`.
+- `context_privacy` ∈ `plain` | `sealed`. Default `sealed`.
 - `disclosure_policy` is free text with no machine meaning; it commits the GM's stated cadence.
 - `chain_length` (N): **default 20000** (§5.7).
 - `beacon` is exactly `null`; only later activation uses a beacon.
@@ -381,12 +384,31 @@ Salts are **derived, not random**. DCs, modifiers, and contexts are low-entropy 
 
 **Player modifiers publish in plaintext** (`seal_modifier: false`). A player already knows their own bonus, so publishing it leaks nothing and buys the one check cryptography cannot provide: verification against a source of truth the GM does not control. If the ledger says `+3` and the sheet says `+8`, the player catches it. In practice this catches honest arithmetic errors — PF2e modifier stacking is error-prone — far more often than anything adversarial. It also solves the archival problem of reconstructing an old bonus after many sessions and level changes.
 
+A sheet stores **named modifier profiles**, each an exact final bonus such as
+`"Society": 5` or `"Brokhold Lore": 7`; the check type remains an audit and
+routing category, not a skill identifier. Each slot may have a private default
+profile pointer for each check type. For a player draw, the applicable public
+sheet is the snapshot with the greatest `(effective_from, seq)` among entries
+where `sheet-update.seq < draw.seq` and `effective_from` is no later than the
+UTC date of the draw. A snapshot is complete: omission removes a profile and
+does not fall back to an older snapshot. NPC and world sheets are dateless
+private current-value maps and do not participate in verifier cross-checking.
+
 **NPC and world modifiers seal** (`seal_modifier: true`). Publishing a large hidden-character modifier can reveal that character's approximate level or capabilities.
 
 Every `draw` has exactly one modifier form: `modifier` or `mod_commit`,
 according to its registry type. A modifier is mandatory even when it is zero.
-For player slots the server may fill it from the latest public sheet; NPC and
-world values come from private sheet state and open through disclosure.
+The final number is resolved at draw time from an explicitly selected profile,
+the type's default profile, or a manual override. NPC and world values come
+from private sheet state and open through disclosure.
+
+The server attributes that number with one canonical directive, always the
+final line of the **draw** context: `@mod "Society"` (a JSON string using
+canonical `JSON.stringify` escaping) or the literal `@mod manual`. It trims
+trailing whitespace from the narrative context and appends exactly one newline
+and the directive; announce contexts never carry it. A disclosed context with
+no directive is legacy/unattributed. Multiple, non-final, or malformed
+directives are advisory verifier warnings and never change the hard verdict.
 
 **DCs seal for all secret checks.** This is the worst available live leak: a player knows their bonus is +8, sees `DC 30` the next morning, and can infer whether their character probably succeeded before a single value is disclosed. Even `DC 12` reveals too much. Sealing also pins difficulty at draw time, making DCs comparable in aggregate at reveal: an unusual run such as `18, 18, 18, 18, 31` on one check type becomes visible and answerable.
 
@@ -457,7 +479,7 @@ Compare the total first, then apply the natural-20/natural-1 shift. The verifier
 | `dc-late` | `target_seq`, `dc`\|`dc_commit` | supplies a DC for an earlier draw in the same session |
 | `out-of-band` | `check_type`, optional `slot`, `result`, `reason` | a physical-dice roll made while the system was unavailable; **consumes no position** |
 | `disclose` | `slot`, `lane`, `through_position`, `preimage`, `opened` — array of `{seq, dc?, modifier?, context?}` sorted ascending by `seq` | opens that lane to `through_position` |
-| `sheet-update` | `slot`, `effective_from`, `modifiers` (map check_type → int) | records a **player** PC's modifiers |
+| `sheet-update` | `slot`, `effective_from`, `modifiers` (map profile name → int) | records a **player** PC's complete profile snapshot |
 | `activation-declare` | `declaration` (§2.8, beacon without randomness) | exact later-slot inputs and a future round are public and frozen |
 | `activate` | `activation_record` (§2.8), `tails` (lane → tail hex) | a deferred slot became live |
 | `retire-slot` | `slot`, `reason` | no further draws for that slot |
@@ -470,7 +492,7 @@ Compare the total first, then apply the natural-20/natural-1 shift. The verifier
 
 **Batches.** A party-wide check writes one `draw` per slot sharing a `batch` id, identical `check_type` and DC treatment, written atomically: all entries land or none do.
 
-**Field notes.** `initiator` ∈ `"gm"` | `"player"`. `effective_from` is `YYYY-MM-DD`. `session` is `0` for `genesis` and any entry before the first `session-open`. An `opened` element is `{seq, dc?, modifier?, context?}` where `seq` names the entry that carried the commitment — usually a `draw`, but an `announce` or `dc-late` too, which is why it keys by entry rather than position.
+**Field notes.** `initiator` ∈ `"gm"` | `"player"`. `effective_from` is `YYYY-MM-DD` and applies only to public player snapshots. Profile names are exact, case-sensitive, trimmed, non-empty strings of at most 64 Unicode code points, contain no control characters, line separators, or unpaired UTF-16 surrogates, and must not equal `prototype` or an own-property name of `Object.prototype`. Each `sheet-update.modifiers` map is a complete snapshot, not a patch. `session` is `0` for `genesis` and any entry before the first `session-open`. An `opened` element is `{seq, dc?, modifier?, context?}` where `seq` names the entry that carried the commitment — usually a `draw`, but an `announce` or `dc-late` too, which is why it keys by entry rather than position.
 
 ### 3.3 Ledger invariants (the verifier MUST check all)
 
@@ -739,7 +761,16 @@ Lists all slots: active (role, lanes, positions, retired state), pending activat
 
 ### 7.5 `/sheets` — modifiers
 
-Editable per-slot modifier table keyed by check type. **Player** slots write a public `sheet-update` entry on save with an `effective_from` date, including players activated later. **NPC and world** sheets remain private; each modifier actually used in a draw is committed and opens with that draw at disclosure/final reveal (§2.12). The unused private sheet table itself is not a ledger artifact.
+Editable per-slot named profiles plus a per-check-type default-profile picker.
+Saving a **player** slot writes a public `sheet-update` with an
+`effective_from` date and the complete profile map, including for players
+activated later. Omitted names are deleted. Saving an **NPC or world** slot
+replaces its dateless private current-value map; the UI hides
+`effective_from`, and the API rejects it rather than ignoring it. Defaults are
+private convenience pointers, never copied values or ledger commitments. Each
+private modifier actually used in a draw is committed and opens with that draw
+at disclosure/final reveal (§2.12); the private sheet and defaults themselves
+are not ledger artifacts.
 
 This is the highest-value ergonomic feature in the app: it removes typing from the hot path and produces a better archival record than manual entry would.
 
@@ -805,7 +836,17 @@ Permanently visible, non-collapsible, titled "What this proves and what it doesn
 
 ### 8.4 Modifier cross-check
 
-Every draw's published modifier grouped by check type and date range, alongside `sheet-update` history, so a player can compare against their own sheet in one pass. Flag disagreements — advisory, not a failure.
+For each draw whose context and modifier are public or disclosed, parse the
+final `@mod` directive and show the selected profile or deliberate manual
+override. For a profile, compare the draw modifier with that name in the
+applicable complete player snapshot: greatest `(effective_from, seq)` where
+`sheet-update.seq < draw.seq` and `effective_from ≤ draw-date`. Do not fall
+back when the chosen snapshot omits the name. A manual override is displayed
+but not compared; NPC/world profiles are not cross-checkable because their
+sheets are private. A missing directive is labeled legacy/unattributed and may
+use the old check-type-key lookup as a labeled fallback. Missing profile
+values, disagreements, and malformed or multiple directives are advisory only
+and never change the cryptographic verdict.
 
 ### 8.5 Post-reveal audit
 
@@ -819,7 +860,7 @@ Full-reveal audit may recompute tens of lanes × 20,000 links. `crypto.subtle.di
 
 ### 8.7 `verify.py`
 
-Same checks, CLI, exit 0/1, `--json`, `--vectors`, including the independent vector self-check. Comment the crypto and favor readable duplication over artificial line-count targets.
+Same checks, CLI, exit 0/1, `--json`, `--vectors`, including the independent vector self-check. Human output lists advisory modifier notes after hard failures; `--json` includes the identical `modifier_checks` and `advisories` records returned by the TypeScript and browser verifiers. Comment the crypto and favor readable duplication over artificial line-count targets.
 
 ---
 

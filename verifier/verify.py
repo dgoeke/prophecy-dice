@@ -273,6 +273,8 @@ TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 LANE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 PROFILE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+MOD_DIRECTIVE_RE = re.compile(
+    r"^@mod(?:[ \t\v\f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]|$)")
 PROFILE_TRIM_CHARS = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680" \
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a" \
     "\u2028\u2029\u202f\u205f\u3000\ufeff"
@@ -288,7 +290,40 @@ def valid_profile_name(value) -> bool:
         and value == value.strip(PROFILE_TRIM_CHARS) \
         and 1 <= len(value) <= 64 \
         and PROFILE_CONTROL_RE.search(value) is None \
+        and all(not 0xD800 <= ord(ch) <= 0xDFFF for ch in value) \
         and value not in FORBIDDEN_PROFILE_NAMES
+
+
+def json_stringify(value) -> str:
+    """The JSON.stringify spelling for a string, including lone surrogates."""
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return "".join(f"\\u{ord(ch):04x}" if 0xD800 <= ord(ch) <= 0xDFFF else ch
+                   for ch in encoded)
+
+
+def parse_mod_directive(context: str) -> dict:
+    """Parse only the canonical final-line audit directive. Never raises."""
+    lines = re.split(r"\r\n|[\r\n\u2028\u2029]", context)
+    directives = [(i, line) for i, line in enumerate(lines)
+                  if MOD_DIRECTIVE_RE.match(line)]
+    if not directives:
+        return {"kind": "legacy"}
+    if len(directives) != 1 or directives[0][0] != len(lines) - 1:
+        return {"kind": "malformed"}
+    line = directives[0][1]
+    if line == "@mod manual":
+        return {"kind": "manual"}
+    if not line.startswith("@mod "):
+        return {"kind": "malformed"}
+    encoded = line[5:]
+    try:
+        name = json.loads(encoded)
+        canonical_name = json_stringify(name)
+        if isinstance(name, str) and valid_profile_name(name) and canonical_name == encoded:
+            return {"kind": "profile", "name": name}
+    except (ValueError, TypeError):
+        pass
+    return {"kind": "malformed"}
 
 # Well-known drand chains (§2.8): recognized hash ⇒ params must match.
 KNOWN_CHAINS = {
@@ -407,15 +442,107 @@ def _valid_date(v) -> bool:
         return False
 
 
+def modifier_cross_checks(entries: list, slots: dict, opened: dict) -> dict:
+    """Build advisory profile checks from public or correctly opened values."""
+    checks: list[dict] = []
+    advisories: list[str] = []
+    sheets = [e for e in entries if isinstance(e, dict)
+              and e.get("kind") == "sheet-update" and _is_int(e.get("seq"))
+              and isinstance(e.get("slot"), str) and _valid_date(e.get("effective_from"))
+              and isinstance(e.get("modifiers"), dict)]
+    sheet_slots = {e["slot"] for e in sheets}
+
+    for draw in entries:
+        if not isinstance(draw, dict) or draw.get("kind") != "draw" \
+                or not _is_int(draw.get("seq")) or not isinstance(draw.get("slot"), str) \
+                or not isinstance(draw.get("check_type"), str):
+            continue
+        opened_values = _dget(opened, draw["seq"], {}) or {}
+        modifier = draw.get("modifier") if _is_int(draw.get("modifier")) \
+            else opened_values.get("modifier") if _is_int(opened_values.get("modifier")) else None
+        date = draw.get("ts", "")[:10] if isinstance(draw.get("ts"), str) else ""
+        applicable = [sheet for sheet in sheets if sheet["slot"] == draw["slot"]
+                      and sheet["seq"] < draw["seq"] and sheet["effective_from"] <= date]
+        applicable.sort(key=lambda sheet: (sheet["effective_from"], sheet["seq"]))
+        sheet = applicable[-1] if applicable else None
+        st = _dget(slots, draw["slot"], {}) or {}
+        is_player = st.get("role") == "player" or draw["slot"] in sheet_slots
+
+        if isinstance(draw.get("context"), str):
+            parsed = parse_mod_directive(draw["context"])
+        elif isinstance(opened_values.get("context"), str):
+            parsed = parse_mod_directive(opened_values["context"])
+        elif "context_commit" in draw:
+            parsed = {"kind": "sealed"}
+        elif "context" in draw or "context" in opened_values:
+            parsed = {"kind": "malformed"}
+        else:
+            parsed = {"kind": "legacy"}
+
+        attribution = parsed["kind"]
+        profile = parsed.get("name")
+        sheet_modifier = None
+        if attribution == "sealed":
+            status = "sealed"
+        elif attribution == "manual":
+            status = "manual_override"
+        elif attribution == "malformed":
+            status = "malformed"
+            advisories.append(f"modifier: seq {draw['seq']} malformed or multiple @mod directive")
+        elif attribution == "legacy":
+            advisories.append(f"modifier: seq {draw['seq']} legacy/unattributed context")
+            fallback = _dget(sheet.get("modifiers") if sheet else {}, draw["check_type"])
+            if _is_int(fallback):
+                sheet_modifier = fallback
+                if modifier is None:
+                    status = "sealed"
+                elif modifier == fallback:
+                    status = "match"
+                else:
+                    status = "mismatch"
+                    advisories.append(
+                        f"modifier: seq {draw['seq']} published modifier {modifier} "
+                        f"differs from legacy {draw['check_type']} value {fallback}")
+            else:
+                status = "legacy"
+        else:
+            saved = _dget(sheet.get("modifiers") if sheet else {}, profile)
+            if not _is_int(saved):
+                status = "unavailable"
+                if is_player:
+                    name = json_stringify(profile)
+                    advisories.append(
+                        f"modifier: seq {draw['seq']} no applicable sheet value for profile {name}")
+            else:
+                sheet_modifier = saved
+                if modifier is None:
+                    status = "sealed"
+                elif modifier == saved:
+                    status = "match"
+                else:
+                    status = "mismatch"
+                    name = json_stringify(profile)
+                    advisories.append(
+                        f"modifier: seq {draw['seq']} published modifier {modifier} "
+                        f"differs from profile {name} value {saved}")
+        checks.append({
+            "seq": draw["seq"], "slot": draw["slot"], "check_type": draw["check_type"],
+            "date": date, "modifier": modifier, "attribution": attribution,
+            "profile": profile, "sheet_modifier": sheet_modifier, "status": status,
+        })
+    return {"modifier_checks": checks, "advisories": advisories}
+
+
 def verify_ledger(file) -> dict:
-    """Check all §3.3 invariants. Returns {verdict, state, failures, entries, rolls}."""
+    """Check invariants and return hard failures plus advisory modifier checks."""
     failures: list[str] = []
     fail = failures.append
     rolls: dict[int, int] = {}
 
     if not isinstance(file, dict) or not isinstance(file.get("entries"), list):
         return {"verdict": "FAILED", "state": "sealed",
-                "failures": ["structure: not a ledger file"], "entries": 0, "rolls": rolls}
+                "failures": ["structure: not a ledger file"], "entries": 0, "rolls": rolls,
+                "modifier_checks": [], "advisories": []}
     for key in file:
         if key not in ("format", "head", "entries"):
             fail(f"structure: unexpected ledger field {key}")
@@ -449,7 +576,7 @@ def verify_ledger(file) -> dict:
     if not entries:
         fail("structure: empty ledger")
         return {"verdict": "FAILED", "state": "sealed", "failures": failures,
-                "entries": 0, "rolls": rolls}
+                "entries": 0, "rolls": rolls, "modifier_checks": [], "advisories": []}
 
     # -- semantic state --
     transcript = None
@@ -471,6 +598,7 @@ def verify_ledger(file) -> dict:
     batches: dict[str, dict] = {}
     watermark: dict[str, int] = {}
     opened_seqs: set[int] = set()
+    opened_values: dict[int, dict] = {}
     discloses: list[dict] = []
     pending_sheet_updates: list[dict] = []
     activated_count = 0
@@ -1096,6 +1224,10 @@ def verify_ledger(file) -> dict:
                             ok = False
                         if not ok:
                             fail(f"inv 24: seq {e['seq']} opened {el['seq']} {f} commitment mismatch")
+                opened_values[el["seq"]] = {
+                    **opened_values.get(el["seq"], {}),
+                    **{f: el[f] for f in expect_fields},
+                }
             for seq_left in covered:
                 fail(f"inv 24: seq {e['seq']} opened must include seq "
                      f"{covered[seq_left]['seq']}")
@@ -1223,8 +1355,9 @@ def verify_ledger(file) -> dict:
 
     state = ("fully revealed" if final_reveal is not None
              else "partially disclosed" if saw_disclose else "sealed")
+    advisory = modifier_cross_checks(entries, slots, opened_values)
     return {"verdict": "FAILED" if failures else "VERIFIED", "state": state,
-            "failures": failures, "entries": len(entries), "rolls": rolls}
+            "failures": failures, "entries": len(entries), "rolls": rolls, **advisory}
 
 
 # ---- vector self-check (§9) -------------------------------------------------
@@ -1434,6 +1567,8 @@ def main() -> int:
             print(f"{res['verdict']} ({res['state']}) — {res['entries']} entries")
             for msg in res["failures"]:
                 print(f"  ✗ {msg}")
+            for msg in res["advisories"]:
+                print(f"  ! {msg} (advisory)")
         return 0 if res["verdict"] == "VERIFIED" else 1
     ap.print_help()
     return 2

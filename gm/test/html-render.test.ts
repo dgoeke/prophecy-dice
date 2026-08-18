@@ -62,6 +62,26 @@ describe('verify.html rendering', () => {
     expect(verdict).toContain('FAILED');
     expect(verdict).toContain(vectors.negative_ledgers[0].expected_message);
   });
+  it('renders every modifier-attribution advisory state', async () => {
+    const res = await col.verifyLedger(vectors.ledger.ledger);
+    const row = (seq: number, attribution: string, status: string, profile: string | null = null) => ({
+      seq, slot: 'slot-01', check_type: 'rk-general', date: '2026-08-14', modifier: 5,
+      attribution, profile, sheet_modifier: status === 'unavailable' ? null : 5, status,
+    });
+    res.modifier_checks = [
+      row(1, 'profile', 'match', 'Society'), row(2, 'profile', 'mismatch', 'Occultism'),
+      row(3, 'manual', 'manual_override'), row(4, 'legacy', 'legacy'),
+      row(5, 'malformed', 'malformed'), row(6, 'profile', 'unavailable', 'Arcana'),
+      row(7, 'sealed', 'sealed'),
+    ];
+    col.render(res);
+    const report = document.getElementById('report')!.textContent!;
+    for (const phrase of ['Society', 'differs (advisory)', 'manual override', 'deliberate override',
+      'legacy / unattributed', 'malformed directive (advisory)',
+      'no applicable profile value (advisory)', 'sealed']) {
+      expect(report).toContain(phrase);
+    }
+  });
   it('keeps the disclosure panel non-collapsible and complete (criterion 7)', () => {
     const panel = document.getElementById('panel')!;
     expect(panel.querySelector('details')).toBeNull();

@@ -88,6 +88,51 @@ export interface VerifyResult {
   entries: number;
   /** seq → derived roll, for every draw covered by a valid disclosure. */
   rolls: Record<number, number>;
+  /** Advisory-only profile attribution and sheet-history comparisons. */
+  modifier_checks: ModifierCheck[];
+  advisories: string[];
+}
+
+export interface ModifierCheck {
+  seq: number;
+  slot: string;
+  check_type: string;
+  date: string;
+  modifier: number | null;
+  attribution: 'profile' | 'manual' | 'legacy' | 'malformed' | 'sealed';
+  profile: string | null;
+  sheet_modifier: number | null;
+  status: 'match' | 'mismatch' | 'manual_override' | 'legacy' | 'malformed' | 'unavailable' | 'sealed';
+}
+
+type ParsedModDirective =
+  | { kind: 'profile'; name: string }
+  | { kind: 'manual' }
+  | { kind: 'legacy' }
+  | { kind: 'malformed' }
+  | { kind: 'sealed' };
+
+/** Parse only the canonical final-line audit directive. Never throws. */
+export function parseModDirective(context: string): ParsedModDirective {
+  const lines = context.split(/\r\n|[\r\n\u2028\u2029]/u);
+  const directiveLines = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^@mod(?:\s|$)/u.test(line));
+  if (directiveLines.length === 0) return { kind: 'legacy' };
+  if (directiveLines.length !== 1 || directiveLines[0].index !== lines.length - 1) {
+    return { kind: 'malformed' };
+  }
+  const line = directiveLines[0].line;
+  if (line === '@mod manual') return { kind: 'manual' };
+  if (!line.startsWith('@mod ')) return { kind: 'malformed' };
+  const encoded = line.slice(5);
+  try {
+    const name = JSON.parse(encoded);
+    if (typeof name === 'string' && validProfileName(name) && JSON.stringify(name) === encoded) {
+      return { kind: 'profile', name };
+    }
+  } catch { /* advisory parser: malformed input is classified below */ }
+  return { kind: 'malformed' };
 }
 
 interface SlotState {
@@ -104,13 +149,91 @@ interface Carrier {
   commits: Record<string, string>; // field name → commitment hex
 }
 
+function modifierCrossChecks(
+  entries: any[], slots: Map<string, SlotState>, opened: Map<number, Record<string, unknown>>,
+): { modifier_checks: ModifierCheck[]; advisories: string[] } {
+  const checks: ModifierCheck[] = [];
+  const advisories: string[] = [];
+  const sheets = entries.filter((e) => e?.kind === 'sheet-update'
+    && Number.isInteger(e.seq) && typeof e.slot === 'string' && validDate(e.effective_from)
+    && e.modifiers && typeof e.modifiers === 'object' && !Array.isArray(e.modifiers));
+
+  for (const draw of entries) {
+    if (draw?.kind !== 'draw' || !Number.isInteger(draw.seq)
+        || typeof draw.slot !== 'string' || typeof draw.check_type !== 'string') continue;
+    const openedValues = opened.get(draw.seq) ?? {};
+    const modifierValue = Number.isInteger(draw.modifier) ? draw.modifier
+      : Number.isInteger(openedValues.modifier) ? openedValues.modifier as number : null;
+    const date = typeof draw.ts === 'string' ? draw.ts.slice(0, 10) : '';
+    const applicable = sheets.filter((sheet) => sheet.slot === draw.slot
+      && sheet.seq < draw.seq && sheet.effective_from <= date)
+      .sort((a, b) => (a.effective_from < b.effective_from ? -1
+        : a.effective_from > b.effective_from ? 1 : a.seq - b.seq))
+      .at(-1);
+    const isPlayer = slots.get(draw.slot)?.role === 'player'
+      || sheets.some((sheet) => sheet.slot === draw.slot);
+
+    let parsed: ParsedModDirective;
+    if (typeof draw.context === 'string') parsed = parseModDirective(draw.context);
+    else if (typeof openedValues.context === 'string') parsed = parseModDirective(openedValues.context);
+    else if ('context_commit' in draw) parsed = { kind: 'sealed' };
+    else if ('context' in draw || 'context' in openedValues) parsed = { kind: 'malformed' };
+    else parsed = { kind: 'legacy' };
+
+    const attribution: ModifierCheck['attribution'] = parsed.kind;
+    const profile: string | null = parsed.kind === 'profile' ? parsed.name : null;
+    let sheetModifier: number | null = null;
+    let status: ModifierCheck['status'];
+
+    if (parsed.kind === 'sealed') status = 'sealed';
+    else if (parsed.kind === 'manual') {
+      status = 'manual_override';
+    } else if (parsed.kind === 'malformed') {
+      status = 'malformed';
+      advisories.push(`modifier: seq ${draw.seq} malformed or multiple @mod directive`);
+    } else if (parsed.kind === 'legacy') {
+      advisories.push(`modifier: seq ${draw.seq} legacy/unattributed context`);
+      const fallback = applicable?.modifiers?.[draw.check_type];
+      if (Number.isInteger(fallback)) {
+        sheetModifier = fallback;
+        if (modifierValue === null) status = 'sealed';
+        else if (modifierValue === fallback) status = 'match';
+        else {
+          status = 'mismatch';
+          advisories.push(`modifier: seq ${draw.seq} published modifier ${modifierValue} differs from legacy ${draw.check_type} value ${fallback}`);
+        }
+      } else status = 'legacy';
+    } else {
+      const saved = applicable?.modifiers?.[parsed.name];
+      if (!Number.isInteger(saved)) {
+        status = 'unavailable';
+        if (isPlayer) advisories.push(`modifier: seq ${draw.seq} no applicable sheet value for profile ${JSON.stringify(parsed.name)}`);
+      } else {
+        sheetModifier = saved;
+        if (modifierValue === null) status = 'sealed';
+        else if (modifierValue === saved) status = 'match';
+        else {
+          status = 'mismatch';
+          advisories.push(`modifier: seq ${draw.seq} published modifier ${modifierValue} differs from profile ${JSON.stringify(parsed.name)} value ${saved}`);
+        }
+      }
+    }
+    checks.push({
+      seq: draw.seq, slot: draw.slot, check_type: draw.check_type, date,
+      modifier: modifierValue, attribution, profile, sheet_modifier: sheetModifier, status,
+    });
+  }
+  return { modifier_checks: checks, advisories };
+}
+
 export function verifyLedger(file: any): VerifyResult {
   const failures: string[] = [];
   const fail = (m: string) => failures.push(m);
   const rolls: Record<number, number> = {};
+  const emptyAdvisories = { modifier_checks: [] as ModifierCheck[], advisories: [] as string[] };
 
   if (!file || typeof file !== 'object' || !Array.isArray(file.entries)) {
-    return { verdict: 'FAILED', state: 'sealed', failures: ['structure: not a ledger file'], entries: 0, rolls };
+    return { verdict: 'FAILED', state: 'sealed', failures: ['structure: not a ledger file'], entries: 0, rolls, ...emptyAdvisories };
   }
   for (const k of Object.keys(file)) {
     if (!['format', 'head', 'entries'].includes(k)) fail(`structure: unexpected ledger field ${k}`);
@@ -146,7 +269,7 @@ export function verifyLedger(file: any): VerifyResult {
   }
   if (entries.length === 0) {
     fail('structure: empty ledger');
-    return { verdict: 'FAILED', state: 'sealed', failures, entries: 0, rolls };
+    return { verdict: 'FAILED', state: 'sealed', failures, entries: 0, rolls, ...emptyAdvisories };
   }
 
   // ---- semantic state -------------------------------------------------------
@@ -171,6 +294,7 @@ export function verifyLedger(file: any): VerifyResult {
   const batches = new Map<string, { seqs: number[]; session: number; checkType: string }>();
   const watermark = new Map<string, number>();
   const openedSeqs = new Set<number>();
+  const openedValues = new Map<number, Record<string, unknown>>();
   const discloses: { seq: number; slot: string; lane: string; through: number; preimage: string }[] = [];
   const pendingSheetUpdates: { seq: number; slot: string }[] = [];
   let activatedCount = 0;
@@ -753,6 +877,10 @@ export function verifyLedger(file: any): VerifyResult {
               if (!ok) fail(`inv 24: seq ${e.seq} opened ${el.seq} ${f} commitment mismatch`);
             }
           }
+          openedValues.set(el.seq, {
+            ...openedValues.get(el.seq),
+            ...Object.fromEntries(expectFields.map((f) => [f, el[f]])),
+          });
         }
         for (const seqLeft of covered.keys()) {
           fail(`inv 24: seq ${e.seq} opened must include seq ${seqLeft}`);
@@ -886,8 +1014,9 @@ export function verifyLedger(file: any): VerifyResult {
 
   const state: VerifyResult['state'] =
     finalReveal !== null ? 'fully revealed' : sawDisclose ? 'partially disclosed' : 'sealed';
+  const advisory = modifierCrossChecks(entries, slots, openedValues);
   return {
     verdict: failures.length > 0 ? 'FAILED' : 'VERIFIED',
-    state, failures, entries: entries.length, rolls,
+    state, failures, entries: entries.length, rolls, ...advisory,
   };
 }

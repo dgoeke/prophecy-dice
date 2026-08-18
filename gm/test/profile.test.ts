@@ -29,7 +29,7 @@ const withSheetName = (name: string) => {
 
 describe('modifier profile names', () => {
   const forbidden = ['prototype', ...Object.getOwnPropertyNames(Object.prototype)];
-  const invalid = ['', ' Society', 'Society ', 'x'.repeat(65), 'line\nbreak', 'nul\0name', 'line\u2028break', ...forbidden];
+  const invalid = ['', ' Society', 'Society ', 'x'.repeat(65), 'line\nbreak', 'nul\0name', 'line\u2028break', '\ud800', ...forbidden];
 
   it('implements the hardened predicate in TypeScript', () => {
     for (const name of invalid) expect(validProfileName(name), JSON.stringify(name)).toBe(false);
@@ -57,7 +57,7 @@ describe('modifier profile names', () => {
   });
 
   it('rejects hardened names in all three verifiers', async () => {
-    for (const name of ['__proto__', 'constructor', 'prototype', ' padded', 'x'.repeat(65), '🔥'.repeat(65), 'bad\nname']) {
+    for (const name of ['__proto__', 'constructor', 'prototype', ' padded', 'x'.repeat(65), '🔥'.repeat(65), 'bad\nname', '\ud800']) {
       const ledger = withSheetName(name);
       expect(verifyLedger(ledger).failures).toContain(malformedSheet);
       expect((await browserVerify(ledger)).failures).toContain(malformedSheet);

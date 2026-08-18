@@ -12,12 +12,14 @@ import { spawnSync } from 'node:child_process';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const VERIFY_PY = join(TEST_DIR, '../../verifier/verify.py');
+const VERIFY_HTML = readFileSync(join(TEST_DIR, '../../verifier/verify.html'), 'utf8');
 import { Campaign } from '../server/campaign.ts';
 import { createServer } from '../server/http.ts';
 import { decryptJson } from '../server/store.ts';
 import { verifyLedger } from '../core/verify.ts';
 import { defaultLanesForRole } from '../src/api.ts';
 import { canonicalBytes } from '../core/canonical.ts';
+import { entryHash, ZERO64 } from '../core/ledger.ts';
 import * as C from '../core/crypto.ts';
 import type { BeaconProvider } from '../server/beacon.ts';
 
@@ -82,6 +84,43 @@ async function makeCampaign(over: Record<string, unknown> = {}) {
   return { campaign, clock, stateDir, publicDir };
 }
 
+let browserVerify: ((ledger: unknown) => Promise<any>) | null = null;
+function verifyInBrowser(ledger: unknown): Promise<any> {
+  if (!browserVerify) {
+    new Function(VERIFY_HTML.match(/<script>([\s\S]*)<\/script>/)![1])();
+    browserVerify = (globalThis as any).__column.verifyLedger;
+  }
+  return browserVerify!(ledger);
+}
+
+function rehashLedger(ledger: any): any {
+  let prev = ZERO64;
+  for (const entry of ledger.entries) {
+    entry.prev = prev;
+    entry.hash = entryHash(entry);
+    prev = entry.hash;
+  }
+  ledger.head = prev;
+  return ledger;
+}
+
+async function verifyModifierParity(ledger: any) {
+  const ts = verifyLedger(ledger);
+  const browser = await verifyInBrowser(ledger);
+  const dir = tmp(), path = join(dir, 'ledger.json');
+  writeFileSync(path, JSON.stringify(ledger));
+  const pyRun = spawnSync('python3', [VERIFY_PY, path, '--json'], { encoding: 'utf8' });
+  expect(pyRun.stderr).toBe('');
+  const py = JSON.parse(pyRun.stdout);
+  expect(browser.modifier_checks).toEqual(ts.modifier_checks);
+  expect(browser.advisories).toEqual(ts.advisories);
+  expect(py.modifier_checks).toEqual(ts.modifier_checks);
+  expect(py.advisories).toEqual(ts.advisories);
+  expect(browser.verdict, browser.failures.join('\n')).toBe(ts.verdict);
+  expect(py.verdict, py.failures.join('\n')).toBe(ts.verdict);
+  return ts;
+}
+
 /** Decrypt the private state out-of-band and derive all secret material. */
 function secretMaterial(stateDir: string, ledger: any) {
   const { obj } = decryptJson(readFileSync(join(stateDir, 'private.enc'), 'utf8'), PASS);
@@ -108,13 +147,14 @@ describe('lifecycle', () => {
     });
     await campaign.precommit(PASS);
     const input = {
-      campaign: 'Frozen', chain_length: 100, context_privacy: 'plain' as const,
+      campaign: 'Frozen', chain_length: 100,
       disclosure_policy: 'x', check_types: CHECK_TYPES, reserve_total: 2,
       active_slots: [
         { display: 'Alice', role: 'player', lanes: ['sealed', 'open'], nonce: 'placeholder' },
       ],
     };
     const frozen = await campaign.freezeGenesisConfiguration(input);
+    expect(frozen.configuration.context_privacy).toBe('sealed');
     expect(frozen.configuration_commitment).toMatch(/^[0-9a-f]{64}$/);
     campaign.lock();
     const resumed = new Campaign({
@@ -592,7 +632,7 @@ describe('modifier profiles and planned draws', () => {
 
   it('rejects malformed profile names at both server write boundaries', async () => {
     const { campaign } = await makeCampaign();
-    for (const name of ['', ' padded', 'x'.repeat(65), '__proto__', 'constructor', 'prototype', 'bad\nname']) {
+    for (const name of ['', ' padded', 'x'.repeat(65), '__proto__', 'constructor', 'prototype', 'bad\nname', '\ud800']) {
       const modifiers = Object.fromEntries([[name, 4]]);
       await expect(campaign.sheetUpdate({
         slot: 'slot-01', effective_from: '2026-08-14', modifiers,
@@ -681,6 +721,116 @@ describe('modifier profiles and planned draws', () => {
       'shared question\n@mod "Society"', 'shared question\n@mod "Occultism"',
     ]);
     expect(verifyLedger(campaign.ledgerJson()).verdict).toBe('VERIFIED');
+  });
+
+  it('cross-checks profile attribution identically in all three verifiers', async () => {
+    const { campaign, clock, stateDir } = await makeCampaign();
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5 },
+    });
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 6 },
+    });
+    // Present in the ledger but not yet applicable to the first two draws.
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-16', modifiers: { Society: 8 },
+    });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
+    await campaign.sessionOpen();
+    const profiled = await campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', context: 'profiled check',
+    });
+    const manual = await campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', modifier: 9, context: 'manual check',
+    });
+    // Same effective date and a later seq would win without the strict seq < draw.seq rule.
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 99 },
+    });
+    clock.advance(2 * 24 * 3600 * 1000);
+    const future = await campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', context: 'future check',
+    });
+
+    const sealed = await verifyModifierParity(campaign.ledgerJson());
+    expect(sealed.verdict).toBe('VERIFIED');
+    expect(sealed.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+      .toMatchObject({ attribution: 'sealed', status: 'sealed', modifier: 6 });
+
+    await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 3 });
+    const base = campaign.ledgerJson();
+    const verified = await verifyModifierParity(base);
+    expect(verified.verdict).toBe('VERIFIED');
+    expect(verified.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+      .toMatchObject({ attribution: 'profile', profile: 'Society', modifier: 6, sheet_modifier: 6, status: 'match' });
+    expect(verified.modifier_checks.find((c) => c.seq === manual.entry.seq))
+      .toMatchObject({ attribution: 'manual', modifier: 9, sheet_modifier: null, status: 'manual_override' });
+    expect(verified.modifier_checks.find((c) => c.seq === future.entry.seq))
+      .toMatchObject({ attribution: 'profile', modifier: 8, sheet_modifier: 8, status: 'match' });
+
+    const priorSnapshot = (ledger: any) => ledger.entries.find((e: any) =>
+      e.kind === 'sheet-update' && e.seq < profiled.entry.seq && e.modifiers?.Society === 6);
+    const mismatch = structuredClone(base);
+    priorSnapshot(mismatch).modifiers.Society = 7;
+    const mismatchResult = await verifyModifierParity(rehashLedger(mismatch));
+    expect(mismatchResult.verdict).toBe('VERIFIED');
+    expect(mismatchResult.modifier_checks.find((c) => c.seq === profiled.entry.seq)?.status).toBe('mismatch');
+
+    const omitted = structuredClone(base);
+    priorSnapshot(omitted).modifiers = {};
+    const omittedResult = await verifyModifierParity(rehashLedger(omitted));
+    expect(omittedResult.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+      .toMatchObject({ sheet_modifier: null, status: 'unavailable' });
+
+    const material = secretMaterial(stateDir, base);
+    const rewriteContext = (source: any, context: string) => {
+      const ledger = structuredClone(source);
+      const draw = ledger.entries[profiled.entry.seq];
+      const links = material.links.get(`${draw.slot}/${draw.lane}`)!;
+      draw.context_commit = C.contextCommit(C.preimageAt(links, draw.position), draw.seq, context);
+      const opened = ledger.entries.filter((e: any) => e.kind === 'disclose')
+        .flatMap((e: any) => e.opened).find((e: any) => e.seq === draw.seq);
+      opened.context = context;
+      return rehashLedger(ledger);
+    };
+
+    const legacy = structuredClone(base);
+    priorSnapshot(legacy).modifiers['rk-general'] = 6;
+    const legacyResult = await verifyModifierParity(rewriteContext(legacy, 'legacy context'));
+    expect(legacyResult.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+      .toMatchObject({ attribution: 'legacy', sheet_modifier: 6, status: 'match' });
+    expect(legacyResult.advisories).toContain(
+      `modifier: seq ${profiled.entry.seq} legacy/unattributed context`);
+
+    for (const context of [
+      '@mod "Society"\nnot final',
+      'duplicate\n@mod "Society"\n@mod "Society"',
+      'invalid\n@mod {"name":"Society"}',
+      'noncanonical\n@mod "\\u0053ociety"',
+    ]) {
+      const result = await verifyModifierParity(rewriteContext(base, context));
+      expect(result.verdict).toBe('VERIFIED');
+      expect(result.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+        .toMatchObject({ attribution: 'malformed', status: 'malformed' });
+    }
+
+    // Advisory output remains cross-verifier-identical even when the hard
+    // structure verdict has already failed.
+    const bothContextForms = structuredClone(base);
+    bothContextForms.entries[profiled.entry.seq].context = 'invalid dual form\n@mod manual';
+    const dualResult = await verifyModifierParity(rehashLedger(bothContextForms));
+    expect(dualResult.verdict).toBe('FAILED');
+    expect(dualResult.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+      .toMatchObject({ attribution: 'manual', status: 'manual_override' });
+
+    const fractionalModifier = structuredClone(base);
+    fractionalModifier.entries[profiled.entry.seq].modifier = 6.5;
+    // Floats are not canonical protocol JSON, so this deliberately retains
+    // the stale hash and exercises advisory parity on a multiply-invalid file.
+    const fractionalResult = await verifyModifierParity(fractionalModifier);
+    expect(fractionalResult.verdict).toBe('FAILED');
+    expect(fractionalResult.modifier_checks.find((c) => c.seq === profiled.entry.seq))
+      .toMatchObject({ attribution: 'profile', modifier: null, status: 'sealed' });
   });
 
   it('leaves all batch state untouched when a later member lacks a profile', async () => {
