@@ -387,7 +387,10 @@ Salts are **derived, not random**. DCs, modifiers, and contexts are low-entropy 
 A sheet stores **named modifier profiles**, each an exact final bonus such as
 `"Society": 5` or `"Brokhold Lore": 7`; the check type remains an audit and
 routing category, not a skill identifier. Each slot may have a private default
-profile pointer for each check type. For a player draw, the applicable public
+profile pointer for each check type. Immediately after genesis, the producer
+writes a complete `{ "Default": 0 }` player snapshot for every genesis-active
+player and privately assigns `Default` to every check type available to that
+slot's role and lanes. For a player draw, the applicable public
 sheet is the snapshot with the greatest `(effective_from, seq)` among entries
 where `sheet-update.seq < draw.seq` and `effective_from` is no later than the
 UTC date of the draw. A snapshot is complete: omission removes a profile and
@@ -762,6 +765,9 @@ Lists all slots: active (role, lanes, positions, retired state), pending activat
 ### 7.5 `/sheets` — modifiers
 
 Editable per-slot named profiles plus a per-check-type default-profile picker.
+Genesis bootstrapping creates a `Default` +0 profile for every active player
+and selects it for every check that player can make, so a new campaign is
+immediately drawable without silently omitting a modifier.
 Saving a **player** slot writes a public `sheet-update` with an
 `effective_from` date and the complete profile map, including for players
 activated later. Omitted names are deleted. Saving an **NPC or world** slot

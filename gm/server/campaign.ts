@@ -379,6 +379,23 @@ export class Campaign {
         }
       }
       const entry = this.append({ kind: 'genesis', transcript, tails });
+      // A fresh campaign must be immediately drawable without forcing the GM
+      // through /sheets before the first session. Player profiles are public
+      // complete snapshots, so bootstrap one auditable +0 profile per active
+      // player and privately point every check that slot can make at it.
+      for (const slot of slots) {
+        if (slot.status !== 'active' || slot.role !== 'player') continue;
+        this.priv!.profile_defaults[slot.id] = Object.fromEntries(
+          transcript.check_types
+            .filter((type: any) => type.roles.includes('player') && slot.lanes.includes(type.lane))
+            .map((type: any) => [type.id, 'Default']),
+        );
+        this.append({
+          kind: 'sheet-update', slot: slot.id,
+          effective_from: transcript.created_at.slice(0, 10),
+          modifiers: { Default: 0 },
+        });
+      }
       this.writePrivate();
       this.writeLedger();
       this.load(); // re-read and re-verify the ledger we just wrote

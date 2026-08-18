@@ -53,8 +53,9 @@ beforeAll(async () => {
   };
   await campaign.freezeGenesisConfiguration(genesisInput);
   await campaign.genesis(genesisInput);
+  const today = new Date().toISOString().slice(0, 10);
   await campaign.sheetUpdate({
-    slot: 'slot-01', effective_from: '2026-08-14',
+    slot: 'slot-01', effective_from: today,
     modifiers: { Society: 5, Perception: 7, Occultism: 4 },
   });
   const playerDefaults = Object.fromEntries(SUGGESTED_REGISTRY
@@ -63,13 +64,13 @@ beforeAll(async () => {
       : type.id === 'perception-secret' || type.id === 'sense-motive' ? 'Perception' : 'Society']));
   await campaign.profileDefaults({ slot: 'slot-01', defaults: playerDefaults });
   await campaign.sheetUpdate({
-    slot: 'slot-02', effective_from: '2026-08-14',
+    slot: 'slot-02', effective_from: today,
     modifiers: { Society: 6, Perception: 5, Occultism: 3 },
   });
   await campaign.profileDefaults({ slot: 'slot-02', defaults: playerDefaults });
   for (const [slot, modifier] of [['slot-03', 4], ['slot-04', 3], ['slot-05', 2]] as const) {
     await campaign.sheetUpdate({
-      slot, effective_from: '2026-08-14',
+      slot, effective_from: today,
       modifiers: { Society: modifier, Perception: modifier, Occultism: modifier },
     });
     await campaign.profileDefaults({ slot, defaults: playerDefaults });

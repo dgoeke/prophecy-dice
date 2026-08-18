@@ -139,6 +139,39 @@ function secretMaterial(stateDir: string, ledger: any) {
 }
 
 describe('lifecycle', () => {
+  it('bootstraps every active player with a Default +0 profile for all available checks', async () => {
+    const { campaign } = await makeCampaign();
+    const ledger = campaign.ledgerJson();
+    const bootstrapSheets = ledger.entries.filter((e: any) => e.kind === 'sheet-update');
+    expect(bootstrapSheets.map((e: any) => ({
+      slot: e.slot, effective_from: e.effective_from, modifiers: e.modifiers,
+    }))).toEqual([
+      { slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Default: 0 } },
+      { slot: 'slot-02', effective_from: '2026-08-14', modifiers: { Default: 0 } },
+    ]);
+
+    const table = campaign.tableState();
+    const playerTypes = CHECK_TYPES
+      .filter((type) => type.roles.includes('player') && ['sealed', 'open'].includes(type.lane))
+      .map((type) => type.id);
+    expect(table.sheets['slot-01']).toEqual({ Default: 0 });
+    expect(table.sheets['slot-02']).toEqual({ Default: 0 });
+    expect(table.profile_defaults['slot-01']).toEqual(
+      Object.fromEntries(playerTypes.map((type) => [type, 'Default'])),
+    );
+    expect(table.profile_defaults['slot-02']).toEqual(
+      Object.fromEntries(playerTypes.map((type) => [type, 'Default'])),
+    );
+    expect(table.profile_defaults['slot-03']).toBeUndefined();
+    expect(table.npc_sheets['slot-03']).toBeUndefined();
+
+    await campaign.sessionOpen();
+    const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', dc: 15 });
+    expect(draw.modifier).toBe(0);
+    expect(draw.entry.modifier).toBe(0);
+    expect(verifyLedger(campaign.ledgerJson()).failures).toEqual([]);
+  });
+
   it('freezes all genesis routing choices before accepting player entropy', async () => {
     const clock = new FakeClock();
     const stateDir = tmp(), publicDir = tmp();
@@ -415,8 +448,11 @@ describe('ordered allocation (§9.2)', () => {
 
   it('names the fix when no modifier is recorded', async () => {
     const { campaign } = await makeCampaign();
+    // Bootstrapping supplies Default +0; explicitly remove this check's
+    // private pointer to exercise the repair path.
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: {} });
     await campaign.sessionOpen();
-    // slot-01 has no sheet yet: the refusal must say what to do about it
+    // A missing default must say exactly how to repair it.
     await expect(campaign.draw({ slot: 'slot-01', check_type: 'perception-secret', dc: 15 }))
       .rejects.toThrow(/set it on \/sheets, or press m at the table/);
     // and the table's own one-key fix clears it for good
@@ -599,7 +635,7 @@ describe('modifier profiles and planned draws', () => {
     await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
     await campaign.sessionOpen();
     await expect(campaign.draw({ slot: 'slot-01', check_type: 'rk-general' })).rejects.toThrow(/no modifier recorded/);
-    expect(campaign.tableState().sheets['slot-01']).toBeUndefined();
+    expect(campaign.tableState().sheets['slot-01']).toEqual({ Default: 0 });
     clock.advance(24 * 3600 * 1000);
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 10 } });
     const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general' });
@@ -837,6 +873,7 @@ describe('modifier profiles and planned draws', () => {
     const { campaign, stateDir } = await makeCampaign();
     await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Perception: 7 } });
     await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'perception-secret': 'Perception' } });
+    await campaign.profileDefaults({ slot: 'slot-02', defaults: {} });
     await campaign.sessionOpen();
     const beforeEntries = campaign.ledgerJson().entries.length;
     const beforePrivate = readFileSync(join(stateDir, 'private.enc'), 'utf8');
