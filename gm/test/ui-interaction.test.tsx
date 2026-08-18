@@ -489,7 +489,7 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.keyDown(overlay, { key: 'm' });
-    const manual = await screen.findByLabelText('ritual manual modifier') as HTMLInputElement;
+    let manual = await screen.findByLabelText('ritual manual modifier') as HTMLInputElement;
     expect(document.activeElement).toBe(manual);
     fireEvent.change(manual, { target: { value: '-' } });
     expect(document.activeElement).toBe(manual);
@@ -500,6 +500,26 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     fireEvent.change(manual, { target: { value: '-3' } });
     expect(document.activeElement).toBe(manual);
     expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(false);
+
+    // Enter commits and unmounts the focused input. Focus must return to the
+    // ceremony so its next hotkey works without a mysterious background click.
+    fireEvent.keyDown(manual, { key: 'Enter' });
+    await waitFor(() => expect(document.activeElement).toBe(overlay));
+    expect(screen.getByText('Selected manual -3')).toBeTruthy();
+    fireEvent.keyDown(overlay, { key: 'm' });
+    manual = await screen.findByLabelText('ritual manual modifier') as HTMLInputElement;
+    expect(document.activeElement).toBe(manual);
+    fireEvent.keyDown(manual, { key: 'Escape' });
+    await waitFor(() => expect(document.activeElement).toBe(overlay));
+
+    // The profile hotkey must likewise remain live after that handoff, and a
+    // completed selector choice hands focus back from the <select>.
+    fireEvent.keyDown(overlay, { key: ',' });
+    await waitFor(() => expect(document.activeElement).toBe(overlay));
+    expect(screen.getByText('Selected Perception +7')).toBeTruthy();
+    fireEvent.keyDown(overlay, { key: 'm' });
+    manual = await screen.findByLabelText('ritual manual modifier') as HTMLInputElement;
+    fireEvent.change(manual, { target: { value: '-3' } });
 
     const before = draws().length;
     fireEvent.click(screen.getByText(/^Reveal/));

@@ -657,10 +657,15 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
     overlay.dcInput ?? (overlay.dcVal === null ? '' : String(overlay.dcVal)),
   );
   const overlayRef = useRef<HTMLDivElement>(null);
-  // Give the keyboard ceremony its initial focus once. An inline callback ref
-  // ran again after every controlled-input render and stole focus from the DC
-  // or manual-modifier field after each character.
-  useEffect(() => { overlayRef.current?.focus(); }, []);
+  // Give the keyboard ceremony its initial focus, and reclaim it whenever a
+  // profile/manual choice finishes. The focused manual input unmounts on
+  // Enter/Escape; without this handoff focus falls back to <body> and the
+  // overlay-local m/,/v/Enter hotkeys appear dead until it is clicked. Do not
+  // run while manual editing is active: controlled input renders must retain
+  // their own focus.
+  useEffect(() => {
+    if (!manualEditing) overlayRef.current?.focus();
+  }, [manualEditing, pendingModifier]);
   const manualValue = manualEditing ? integerText(manualInput) : null;
   const confirmed = manualEditing
     ? manualInput.trim() !== '' && manualValue !== null
