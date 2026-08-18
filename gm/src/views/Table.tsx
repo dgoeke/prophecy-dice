@@ -458,7 +458,9 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           <span className="typechip dcchip">
             <span className="keycap">d</span>DC{' '}
             {dcEditing
-              ? <input autoFocus defaultValue={dc ?? ''} onBlur={() => setDcEditing(false)}
+              ? <input autoFocus aria-label="DC" defaultValue={dc ?? ''}
+                  onFocus={(e) => e.currentTarget.select()}
+                  onBlur={() => setDcEditing(false)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') { const v = parseInt((e.target as HTMLInputElement).value, 10); setDc(Number.isFinite(v) ? v : null); setDcEditing(false); }
                     if (e.key === 'Escape') { setDc(null); setDcEditing(false); }

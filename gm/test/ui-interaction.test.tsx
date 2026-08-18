@@ -146,6 +146,29 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     await waitFor(() => expect(document.querySelectorAll('.log .roll').length).toBeGreaterThanOrEqual(4));
   }, 20_000);
 
+  it('selects the existing DC when d reopens the editor', async () => {
+    fireEvent.keyDown(window, { key: '1' });
+    fireEvent.keyDown(window, { key: 'd' });
+    let input = await screen.findByLabelText('DC') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '10' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(screen.getByRole('button', { name: '10' })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: 'd' });
+    input = await screen.findByLabelText('DC') as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(2);
+
+    fireEvent.change(input, { target: { value: '12' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(screen.getByRole('button', { name: '12' })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: 'd' });
+    input = await screen.findByLabelText('DC') as HTMLInputElement;
+    fireEvent.keyDown(input, { key: 'Escape' });
+  });
+
   it('the privacy key veils results and NPC names instantly (§7.3.10)', async () => {
     fireEvent.keyDown(window, { key: '6' });
     await waitFor(() => expect(document.querySelector('.armedbar .who .veilable')?.textContent).toBe('Fenn'));
