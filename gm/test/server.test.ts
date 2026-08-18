@@ -139,7 +139,7 @@ function secretMaterial(stateDir: string, ledger: any) {
 }
 
 describe('lifecycle', () => {
-  it('bootstraps every active player with a Default +0 profile for all available checks', async () => {
+  it('bootstraps active players and World with a Default +0 profile for all available checks', async () => {
     const { campaign } = await makeCampaign();
     const ledger = campaign.ledgerJson();
     const bootstrapSheets = ledger.entries.filter((e: any) => e.kind === 'sheet-update');
@@ -154,6 +154,9 @@ describe('lifecycle', () => {
     const playerTypes = CHECK_TYPES
       .filter((type) => type.roles.includes('player') && ['sealed', 'open'].includes(type.lane))
       .map((type) => type.id);
+    const worldTypes = CHECK_TYPES
+      .filter((type) => type.roles.includes('world') && ['open', 'routine'].includes(type.lane))
+      .map((type) => type.id);
     expect(table.sheets['slot-01']).toEqual({ Default: 0 });
     expect(table.sheets['slot-02']).toEqual({ Default: 0 });
     expect(table.profile_defaults['slot-01']).toEqual(
@@ -162,13 +165,18 @@ describe('lifecycle', () => {
     expect(table.profile_defaults['slot-02']).toEqual(
       Object.fromEntries(playerTypes.map((type) => [type, 'Default'])),
     );
-    expect(table.profile_defaults['slot-03']).toBeUndefined();
-    expect(table.npc_sheets['slot-03']).toBeUndefined();
+    expect(table.profile_defaults['slot-03']).toEqual(
+      Object.fromEntries(worldTypes.map((type) => [type, 'Default'])),
+    );
+    expect(table.npc_sheets['slot-03']).toEqual({ Default: 0 });
 
     await campaign.sessionOpen();
     const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', dc: 15 });
     expect(draw.modifier).toBe(0);
     expect(draw.entry.modifier).toBe(0);
+    const worldDraw = await campaign.draw({ slot: 'slot-03', check_type: 'world-routine', dc: 15 });
+    expect(worldDraw.modifier).toBe(0);
+    expect(worldDraw.entry.mod_commit).toBeDefined();
     expect(verifyLedger(campaign.ledgerJson()).failures).toEqual([]);
   });
 

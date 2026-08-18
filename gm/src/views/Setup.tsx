@@ -314,7 +314,7 @@ export function Setup({ status, onChange }: { status: Status; onChange: () => vo
         {step === 6 && (
           <section className="pane" style={{ textAlign: 'center' }}>
             <h2 style={{ fontFamily: 'var(--font-ceremony)', letterSpacing: '.2em' }}>THE COLUMNS ARE FIXED</h2>
-            <p className="dim">Genesis is written. Every player starts with a Default +0 profile assigned to all of their checks; replace those placeholders on /sheets. Publish the ledger and paste its head into the chat.</p>
+            <p className="dim">Genesis is written. Every player and World start with a Default +0 profile assigned to all of their checks; replace those placeholders on /sheets. Publish the ledger and paste its head into the chat.</p>
             <p><a className="btn primary" href="#/table" onClick={onChange}>to the table →</a></p>
           </section>
         )}

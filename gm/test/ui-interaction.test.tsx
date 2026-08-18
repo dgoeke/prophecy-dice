@@ -268,8 +268,12 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
 
   it('a missing modifier is visible, while m supplies a one-off without changing sheets', async () => {
     // A draw is refused outright without a modifier. The warning is visible
-    // first, and the one-off manual value goes only on the draw request.
-    // 9 arms the world's routine lane; the world has no sheet in this fixture
+    // first, and the one-off manual value goes only on the draw request. The
+    // World normally has its genesis Default; remove the mapping explicitly
+    // to exercise the recovery path before 9 arms its routine lane.
+    await campaign.profileDefaults({ slot: 'slot-10', defaults: {} });
+    cleanup(); render(<App />);
+    await screen.findByText('Alice');
     fireEvent.keyDown(window, { key: '9' });
     await screen.findByText('world-routine');
 
@@ -292,8 +296,15 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     fireEvent.keyDown(window, { key: 'Enter' });
     await waitFor(() => expect(draws()).toHaveLength(before + 1));
     expect(draws().at(-1).mod_commit).toBeDefined();
-    expect(campaign.tableState().npc_sheets['slot-10']).toBeUndefined();
+    expect(campaign.tableState().npc_sheets['slot-10']).toEqual({ Default: 0 });
+    expect(campaign.tableState().profile_defaults['slot-10']).toEqual({});
     expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update')).toHaveLength(beforeSheets);
+    await campaign.profileDefaults({
+      slot: 'slot-10',
+      defaults: Object.fromEntries(SUGGESTED_REGISTRY
+        .filter((type) => type.roles.includes('world'))
+        .map((type) => [type.id, 'Default'])),
+    });
   }, 20_000);
 
   it('warns before an atomic batch when one player has no default profile', async () => {
