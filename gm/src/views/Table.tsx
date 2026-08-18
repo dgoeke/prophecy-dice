@@ -581,7 +581,7 @@ function OverlayHost(props: {
     return (
       <div className="overlay" tabIndex={-1} ref={(el) => el?.focus()} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === 'Escape') close(); }} onClick={close}>
         <div className="ceremony">
-          <div className="numeral">{overlay.roll}</div>
+          <div className="numeral">{total ?? overlay.roll}</div>
           <div className="sub">
             {overlay.label}
             {total !== null && <> · {overlay.roll} {overlay.mod! >= 0 ? `+${overlay.mod}` : overlay.mod} = {total}</>}
@@ -656,6 +656,11 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
   const [dcInput, setDcInput] = useState(
     overlay.dcInput ?? (overlay.dcVal === null ? '' : String(overlay.dcVal)),
   );
+  const overlayRef = useRef<HTMLDivElement>(null);
+  // Give the keyboard ceremony its initial focus once. An inline callback ref
+  // ran again after every controlled-input render and stole focus from the DC
+  // or manual-modifier field after each character.
+  useEffect(() => { overlayRef.current?.focus(); }, []);
   const manualValue = manualEditing ? integerText(manualInput) : null;
   const confirmed = manualEditing
     ? manualInput.trim() !== '' && manualValue !== null
@@ -702,7 +707,7 @@ function Announced({ overlay, setOverlay, typeById, table, push, say, refresh, s
     }
   };
   return (
-    <div className="overlay" tabIndex={-1} ref={(el) => el?.focus()}
+    <div className="overlay" tabIndex={-1} ref={overlayRef}
       onKeyDown={(e) => {
         const target = e.target as HTMLElement;
         if (['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) {

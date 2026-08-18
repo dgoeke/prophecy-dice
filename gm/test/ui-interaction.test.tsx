@@ -381,7 +381,12 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     await screen.findByText(/RITUAL DRAW/);
     fireEvent.click(screen.getByText('Announce'));
     await screen.findByText('ANNOUNCED');
-    fireEvent.change(screen.getByLabelText('ritual DC'), { target: { value: '23' } });
+    const ritualDc = screen.getByLabelText('ritual DC') as HTMLInputElement;
+    ritualDc.focus();
+    fireEvent.change(ritualDc, { target: { value: '2' } });
+    expect(document.activeElement).toBe(ritualDc);
+    fireEvent.change(ritualDc, { target: { value: '23' } });
+    expect(document.activeElement).toBe(ritualDc);
     fireEvent.click(screen.getByText('m — manual'));
     fireEvent.change(screen.getByLabelText('ritual manual modifier'), { target: { value: '-4' } });
 
@@ -484,10 +489,16 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.keyDown(overlay, { key: 'm' });
-    const manual = await screen.findByLabelText('ritual manual modifier');
+    const manual = await screen.findByLabelText('ritual manual modifier') as HTMLInputElement;
+    expect(document.activeElement).toBe(manual);
+    fireEvent.change(manual, { target: { value: '-' } });
+    expect(document.activeElement).toBe(manual);
+    expect(manual.value).toBe('-');
     fireEvent.change(manual, { target: { value: 'not-an-integer' } });
+    expect(document.activeElement).toBe(manual);
     expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(manual, { target: { value: '-3' } });
+    expect(document.activeElement).toBe(manual);
     expect((screen.getByText(/^Reveal/) as HTMLButtonElement).disabled).toBe(false);
 
     const before = draws().length;
@@ -495,8 +506,15 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     await waitFor(() => expect(draws()).toHaveLength(before + 1));
     const recovered = draws().at(-1);
     expect(recovered.modifier).toBe(-3);
-    expect(campaign.disclosePreview(recovered.slot, recovered.lane, recovered.position)
-      .draws.find((draw: any) => draw.seq === recovered.seq)?.context).toContain('@mod manual');
+    const preview = campaign.disclosePreview(recovered.slot, recovered.lane, recovered.position)
+      .draws.find((draw: any) => draw.seq === recovered.seq);
+    expect(preview?.context).toContain('@mod manual');
+    // The ceremony emphasizes the resolved check total; the arithmetic below
+    // still exposes the raw d20 so natural-1/20 adjustments remain legible.
+    expect(document.querySelector('.ceremony .numeral')?.textContent)
+      .toBe(String(preview.roll + recovered.modifier));
+    expect(document.querySelector('.ceremony .sub')?.textContent)
+      .toContain(`${preview.roll} -3 = ${preview.roll - 3}`);
     fireEvent.keyDown(document.querySelector('.overlay')!, { key: 'Enter' });
   }, 20_000);
 

@@ -142,7 +142,10 @@ to anyone who saved the newer one.
   The service runs as `column-rehearsal`, defaults to
   `/var/lib/column-rehearsal/{state,public}`, cannot read production state or
   credentials, and refuses mirrors (§7.8). Default-path rehearsal data is
-  throwaway and is not migrated automatically.
+  throwaway and is not migrated automatically. Use the
+  [rehearsal UX smoke test](spec/rehearsal-ux-smoke.md) for a repeatable live
+  exercise of profiles, announcements, corrections, close recovery, and
+  disclosure boundaries.
 - Post the publish digest to the group chat every session — it is the external
   timestamp anchor, and human memory is the only count control for routine
   draws (§7.7).
