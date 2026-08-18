@@ -1,9 +1,11 @@
 # NixOS module for Prophecy Dice (spec/protocol.md §6.6–§6.8).
 #
-# Two processes, hard separation:
+# Three processes, hard separation:
 #   services.column.gm     — the GM service. Binds ONE address, which must be
 #                            the Tailscale IP on a shared server. Holds every
 #                            sealed value; never expose it publicly.
+#   services.column.rehearsal — an isolated, throwaway GM service with no
+#                            mirror and no access to the real campaign state.
 #   services.column.public — a Caddy vhost serving publicDir read-only. No key
 #                            material, no code path to private state.
 #
@@ -79,6 +81,33 @@ in
       };
     };
 
+    rehearsal = {
+      enable = mkEnableOption "an isolated Prophecy Dice rehearsal service";
+
+      package = mkOption {
+        type = types.package;
+        default = self.packages.${pkgs.system}.column-gm;
+        description = "The column-gm package (server + built UI).";
+      };
+      bindAddress = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "Loopback address to bind behind the system reverse proxy.";
+      };
+      port = mkOption { type = types.port; default = 7778; };
+      stateDir = mkOption {
+        type = types.path;
+        default = "/var/lib/column/rehearsal";
+        description = "Throwaway rehearsal state. Mode 0700.";
+      };
+      publicDir = mkOption {
+        type = types.path;
+        default = "/var/lib/column/rehearsal-public";
+        description = "Published rehearsal artifacts, kept separate from the real ledger.";
+      };
+      drandEndpoint = mkOption { type = types.str; default = "https://api.drand.sh"; };
+    };
+
     public = {
       enable = mkEnableOption "public ledger + verifier vhost (Caddy)";
       domain = mkOption { type = types.str; example = "column.example.org"; };
@@ -101,12 +130,61 @@ in
   };
 
   config = mkMerge [
-    (mkIf cfg.gm.enable {
+    (mkIf (cfg.gm.enable || cfg.rehearsal.enable) {
       users.users.column = { isSystemUser = true; group = "column"; };
       users.groups.column = { };
       # the shared parent is 0755 so a separate static server (caddy) can
       # traverse to publicDir; everything secret lives under stateDir at 0700
       systemd.tmpfiles.rules = [ "d /var/lib/column 0755 column column -" ];
+    })
+
+    (mkIf cfg.rehearsal.enable {
+      systemd.tmpfiles.rules = [
+        "d ${cfg.rehearsal.stateDir} 0700 column column -"
+        "d ${cfg.rehearsal.publicDir} 0755 column column -"
+      ];
+
+      systemd.services.column-rehearsal = {
+        description = "Prophecy Dice — isolated rehearsal service";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        preStart = ''
+          install -m 0644 ${self.packages.${pkgs.system}.column-verifier}/verify.html \
+            ${cfg.rehearsal.publicDir}/verify.html
+        '';
+        environment = {
+          COLUMN_REHEARSAL = "1";
+          COLUMN_STATE_DIR = cfg.rehearsal.stateDir;
+          COLUMN_PUBLIC_DIR = cfg.rehearsal.publicDir;
+          COLUMN_BIND = cfg.rehearsal.bindAddress;
+          COLUMN_PORT = toString cfg.rehearsal.port;
+          COLUMN_DRAND = cfg.rehearsal.drandEndpoint;
+        };
+        serviceConfig = {
+          ExecStart = "${cfg.rehearsal.package}/bin/column-gm";
+          User = "column";
+          Group = "column";
+          Restart = "on-failure";
+          UMask = "0077";
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          PrivateTmp = true;
+          NoNewPrivileges = true;
+          RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+          ReadWritePaths = [ cfg.rehearsal.stateDir cfg.rehearsal.publicDir ];
+          # Rehearsal must not be able to read or overwrite the real secrets,
+          # even though both services use the dedicated `column` Unix user.
+          InaccessiblePaths = [ "-${cfg.gm.stateDir}" ];
+          CapabilityBoundingSet = "";
+          LockPersonality = true;
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectControlGroups = true;
+          RestrictNamespaces = true;
+          SystemCallArchitectures = "native";
+        };
+      };
     })
 
     (mkIf cfg.gm.enable {

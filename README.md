@@ -71,6 +71,7 @@ python3 verifier/verify.py --vectors spec/vectors.json
     bindAddress = "127.0.0.1";    # behind `tailscale serve`; never public
     gitMirrorCommand = "git add ledger.json && git commit -m publish && git push";
   };
+  services.column.rehearsal.enable = true; # isolated :7778 service, no mirror
   services.column.public = {
     enable = true;                 # Caddy vhost: publicDir read-only, no keys
     domain = "column.example.org";
@@ -134,8 +135,10 @@ to anyone who saved the newer one.
 - **Physical dice for anything in initiative order** (§10.1). This tool is for
   secret checks, not combat tempo.
 - Rehearse the ceremony first: `COLUMN_REHEARSAL=1 npm run serve` gives a
-  throwaway campaign that publishes into separate state and public directories
-  by default and refuses any configured mirror (§7.8).
+  throwaway development campaign, while `services.column.rehearsal.enable`
+  provides the same isolation as a persistent NixOS service on port 7778.
+  Both publish into separate state and public directories and refuse mirrors
+  (§7.8).
 - Post the publish digest to the group chat every session — it is the external
   timestamp anchor, and human memory is the only count control for routine
   draws (§7.7).
