@@ -16,14 +16,19 @@ export function Sheets() {
   if (!table) return <p className="dim">…</p>;
 
   const today = new Date().toISOString().slice(0, 10);
-  const save = async (slotId: string, isPublic: boolean) => {
-    const mods: Record<string, number> = {};
+  const save = async (slotId: string, isPublic: boolean, current: Record<string, number>) => {
+    // Session 1 redefines saves as complete snapshots. Preserve every
+    // untouched profile while this transitional check-type editor remains.
+    const mods: Record<string, number> = { ...current };
     for (const [type, v] of Object.entries(edits[slotId] ?? {})) {
       const n = parseInt(v, 10);
       if (Number.isFinite(n)) mods[type] = n;
     }
     try {
-      await api('/api/sheet-update', { slot: slotId, effective_from: dates[slotId] ?? today, modifiers: mods });
+      await api('/api/sheet-update', {
+        slot: slotId, modifiers: mods,
+        ...(isPublic ? { effective_from: dates[slotId] ?? today } : {}),
+      });
       setMsg(isPublic ? `${slotId}: public sheet-update written` : `${slotId}: stored privately — opens at final reveal`);
       refresh();
     } catch (e: any) { setMsg(e.message); }
@@ -49,10 +54,10 @@ export function Sheets() {
                     onChange={(e) => setEdits((x) => ({ ...x, [slot.id]: { ...x[slot.id], [t.id]: e.target.value } }))} />
                 </label>
               ))}
-              <label className="fld">effective from
+              {isPublic && <label className="fld">effective from
                 <input type="date" value={dates[slot.id] ?? today} onChange={(e) => setDates((d) => ({ ...d, [slot.id]: e.target.value }))} />
-              </label>
-              <button className="btn primary" onClick={() => save(slot.id, isPublic)}>Save</button>
+              </label>}
+              <button className="btn primary" onClick={() => save(slot.id, isPublic, current)}>Save</button>
             </div>
           </div>
         );

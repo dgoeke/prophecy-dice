@@ -272,6 +272,23 @@ LEDGER_FORMAT = "wotw-column-ledger/4"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 LANE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+PROFILE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+PROFILE_TRIM_CHARS = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680" \
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a" \
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+FORBIDDEN_PROFILE_NAMES = {
+    "prototype", "constructor", "__defineGetter__", "__defineSetter__",
+    "hasOwnProperty", "__lookupGetter__", "__lookupSetter__", "isPrototypeOf",
+    "propertyIsEnumerable", "toString", "valueOf", "__proto__", "toLocaleString",
+}
+
+
+def valid_profile_name(value) -> bool:
+    return isinstance(value, str) \
+        and value == value.strip(PROFILE_TRIM_CHARS) \
+        and 1 <= len(value) <= 64 \
+        and PROFILE_CONTROL_RE.search(value) is None \
+        and value not in FORBIDDEN_PROFILE_NAMES
 
 # Well-known drand chains (§2.8): recognized hash ⇒ params must match.
 KNOWN_CHAINS = {
@@ -707,8 +724,8 @@ def verify_ledger(file) -> dict:
                 fail(f"structure: seq {e['seq']} sheet-update for non-player slot {e['slot']}")
             modifiers = e.get("modifiers")
             if not _valid_date(e.get("effective_from")) or not isinstance(modifiers, dict) \
-                    or any(cid not in registry or not _is_int(value)
-                           for cid, value in modifiers.items()):
+                    or any(not valid_profile_name(name) or not _is_int(value)
+                           for name, value in modifiers.items()):
                 fail(f"structure: seq {e['seq']} malformed sheet-update")
 
         elif kind == "check-type":

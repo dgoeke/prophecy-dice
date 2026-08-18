@@ -64,6 +64,7 @@ export interface TableState {
   lanes: Record<string, { drawn: number; remaining: number; watermark: number }>;
   sheets: Record<string, Record<string, number>>;
   npc_sheets: Record<string, Record<string, number>>;
+  profile_defaults: Record<string, Record<string, string>>;
   open_announce: null | {
     seq: number; slot: string; lane: string; checkType: string;
     context: string | null; initiator: string;

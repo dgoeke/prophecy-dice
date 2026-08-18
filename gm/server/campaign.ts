@@ -25,6 +25,7 @@ import { canonicalBytes } from '../core/canonical.ts';
 import * as C from '../core/crypto.ts';
 import { entryHash, ZERO64, LEDGER_FORMAT } from '../core/ledger.ts';
 import { KNOWN_CHAINS, verifyLedger } from '../core/verify.ts';
+import { validProfileName } from '../core/profile.ts';
 import {
   atomicWrite, decryptJson, DEFAULT_KDF, deriveKey, encryptJson, Kdf, KdfHeader,
   newKdfHeader, rotateBackup,
@@ -49,6 +50,7 @@ interface Priv {
   values: Record<string, SealedValues>;             // committing seq → sealed values
   labels: Record<string, { display: string; role: string }>; // sealed activation labels
   npc_sheets: Record<string, Record<string, number>>;
+  profile_defaults: Record<string, Record<string, string>>;
   draw_ids: Record<string, number>;                 // transport-level, never in ledger (§6.5)
   batch_ids: Record<string, number[]>;
   pending: (PendingActivation & { declared_at: string }) | null;
@@ -62,6 +64,13 @@ interface PendingActivation {
 interface SlotState {
   role: string | null; display: string | null; lanes: Set<string>;
   active: boolean; retired: boolean; A: Buffer | null;
+}
+interface PlannedDraw {
+  entry: any;
+  roll: number;
+  used: { modifier: number; context: string; dc?: number };
+  effect: { key: string; position: number; resolveAnnounce: boolean };
+  plan: { seq: number; ts: string };
 }
 
 export interface GenesisInput {
@@ -206,7 +215,7 @@ export class Campaign {
       this.priv = {
         secret: S.toString('hex'), precommit_at: this.ts(), rehearsal: !!this.opts.rehearsal,
         configuration_commitment: null, configuration: null,
-        values: {}, labels: {}, npc_sheets: {}, draw_ids: {}, batch_ids: {},
+        values: {}, labels: {}, npc_sheets: {}, profile_defaults: {}, draw_ids: {}, batch_ids: {},
         pending: null, last_published_seq: -1, ui_state: null,
       };
       this.locked = false;
@@ -379,7 +388,7 @@ export class Campaign {
 
   // ---- draws (§6.5, §7.3) ---------------------------------------------------
   async draw(req: {
-    draw_id?: string; slot: string; check_type: string; modifier?: number; dc?: number;
+    draw_id?: string; slot: string; check_type: string; profile?: string; modifier?: number; dc?: number;
     context?: string; announce_seq?: number; initiator?: string;
     paired_with?: number; pair_rule?: string; gm_degree?: number;
   }): Promise<{ entry: any; roll: number; replay: boolean; modifier?: number; dc?: number }> {
@@ -390,19 +399,21 @@ export class Campaign {
         const seq = this.priv!.draw_ids[req.draw_id];
         return { entry: this.entries[seq], roll: this.rollAt(this.entries[seq]), replay: true };
       }
-      const { entry, roll, used } = this.buildDraw(req);
-      const built = this.append(entry);
-      this.storeDrawPrivates(built, req, used.modifier);
+      const plan = { seq: this.entries.length, ts: this.ts() };
+      const draft = this.buildDraw(req, plan);
+      const built = this.append(draft.entry, plan);
+      this.applyDrawEffect(draft);
+      this.storeDrawPrivates(built, draft.used);
       if (req.draw_id) this.priv!.draw_ids[req.draw_id] = built.seq;
       this.writePrivate();
       this.writeLedger();
-      return { entry: built, roll, replay: false, modifier: used.modifier, dc: req.dc };
+      return { entry: built, roll: draft.roll, replay: false, modifier: draft.used.modifier, dc: req.dc };
     });
   }
 
   async batch(req: {
     batch_id: string; check_type: string; dc?: number; context?: string; initiator?: string;
-    slots: { slot: string; modifier?: number }[];
+    slots: { slot: string }[];
   }): Promise<{ entries: any[]; rolls: number[]; replay: boolean; modifiers?: (number | undefined)[] }> {
     return this.mutate(() => {
       this.requireLive();
@@ -414,17 +425,20 @@ export class Campaign {
       }
       if (!Array.isArray(req.slots) || !req.slots.length) err('empty batch');
       if (new Set(req.slots.map((s) => s.slot)).size !== req.slots.length) err('batch slots must be distinct');
-      // atomic: validate and build ALL before appending any (§3.2 batches)
-      const drafts = req.slots.map((s) => this.buildDraw({
-        slot: s.slot, check_type: req.check_type, modifier: s.modifier, dc: req.dc,
+      if (req.slots.some((s) => 'profile' in s || 'modifier' in s)) {
+        err('batch members cannot override profiles or modifiers');
+      }
+      const baseSeq = this.entries.length;
+      const ts = this.ts();
+      // Pure phase: validate and build every member before touching any state.
+      const drafts = req.slots.map((s, i) => this.buildDraw({
+        slot: s.slot, check_type: req.check_type, dc: req.dc,
         context: req.context, initiator: req.initiator, batch: req.batch_id,
-      }));
-      const builtAll = drafts.map((d, i) => {
-        const built = this.append(d.entry);
-        this.storeDrawPrivates(built, {
-          dc: req.dc, context: req.context, modifier: req.slots[i].modifier,
-          slot: req.slots[i].slot, check_type: req.check_type,
-        }, d.used.modifier);
+      }, { seq: baseSeq + i, ts }));
+      const builtAll = drafts.map((d) => {
+        const built = this.append(d.entry, d.plan);
+        this.applyDrawEffect(d);
+        this.storeDrawPrivates(built, d.used);
         return built;
       });
       this.priv!.batch_ids[req.batch_id] = builtAll.map((e) => e.seq);
@@ -434,8 +448,8 @@ export class Campaign {
     });
   }
 
-  /** Validate + assemble a draw entry and consume its position (in memory). */
-  private buildDraw(req: any): { entry: any; roll: number; used: { modifier?: number } } {
+  /** Validate and assemble a draw without mutating ledger, derived, or private state. */
+  private buildDraw(req: any, plan: { seq: number; ts: string }): PlannedDraw {
     if (!this.sessionOpen_) err('draws require an open session');
     const type = this.registry.get(req.check_type) ?? err(`unknown check_type ${req.check_type}`);
     const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
@@ -452,7 +466,6 @@ export class Campaign {
           || a.initiator !== (req.initiator ?? 'gm')) {
         err('announce_seq does not match the exact open announce');
       }
-      this.openAnnounce = null;
     } else if (this.openAnnounce) err('an announce is unresolved: reveal or void it first');
     if (type.ritual && req.announce_seq === undefined) {
       err(`check_type ${req.check_type} is ritual and must be announced before it is drawn`);
@@ -464,26 +477,32 @@ export class Campaign {
     if (position > N) err(`lane ${key} is exhausted (N=${N}); no extension protocol exists`, 409);
     if (position > N * 0.8) console.warn(`[column] warning: ${key} at ${position}/${N} (>80%)`);
     const p = C.preimageAt(links, position);
-    const seq = this.entries.length;
+    const seq = plan.seq;
     const entry: any = {
       kind: 'draw', slot: req.slot, lane, position, check_type: req.check_type,
       initiator: req.initiator ?? 'gm',
     };
     if (entry.initiator !== 'gm' && entry.initiator !== 'player') err('initiator must be gm|player');
-    // §2.12 field forms follow the registry, never the request
-    // Where a modifier comes from is a property of the SLOT's role; whether
-    // it publishes or seals is a property of the check type. Keying the
-    // lookup on seal_modifier left non-player slots with non-sealed types
-    // (public-gm-check on an NPC) with no source at all.
-    let modifier = req.modifier;
-    if (modifier === undefined) {
-      modifier = role === 'player'
-        ? this.playerSheetMod(req.slot, req.check_type)
-        : this.priv!.npc_sheets[req.slot]?.[req.check_type];
+    const hasProfile = req.profile !== undefined;
+    const hasManual = req.modifier !== undefined;
+    if (hasProfile && hasManual) err('profile and modifier are mutually exclusive');
+    if (hasProfile && !validProfileName(req.profile)) err('invalid profile name');
+    if (hasManual && !Number.isInteger(req.modifier)) err('modifier must be an integer');
+    const profile: string | undefined = hasManual
+      ? undefined
+      : hasProfile ? req.profile : this.priv!.profile_defaults[req.slot]?.[req.check_type];
+    if (!hasManual && !validProfileName(profile)) {
+      err(`no modifier recorded for ${req.slot}/${req.check_type} — set it on /sheets, or press m at the table`);
     }
+    const modifier = hasManual
+      ? req.modifier
+      : role === 'player'
+        ? this.playerSheetMod(req.slot, profile!, seq, plan.ts.slice(0, 10))
+        : this.priv!.npc_sheets[req.slot]?.[profile!];
     if (!Number.isInteger(modifier)) {
       err(`no modifier recorded for ${req.slot}/${req.check_type} — set it on /sheets, or press m at the table`);
     }
+    // §2.12 field forms follow the registry, never the request or slot role.
     if (type.seal_modifier) entry.mod_commit = C.modCommit(p, seq, modifier!);
     else entry.modifier = modifier;
     if (req.dc !== undefined && !Number.isInteger(req.dc)) err('dc must be an integer');
@@ -491,12 +510,12 @@ export class Campaign {
       if (type.seal_dc) entry.dc_commit = C.dcCommit(p, seq, req.dc);
       else entry.dc = req.dc;
     }
-    const context = req.context ?? type.label;
-    if (context !== undefined) {
-      if (typeof context !== 'string') err('context must be a string');
-      if (this.transcript.context_privacy === 'sealed') entry.context_commit = C.contextCommit(p, seq, context);
-      else entry.context = context;
-    }
+    const contextBase = req.context ?? type.label;
+    if (typeof contextBase !== 'string') err('context must be a string');
+    if (this.hasModDirective(contextBase)) err('context must not contain an @mod directive');
+    const context = `${contextBase.trimEnd()}\n@mod ${hasManual ? 'manual' : JSON.stringify(profile)}`;
+    if (this.transcript.context_privacy === 'sealed') entry.context_commit = C.contextCommit(p, seq, context);
+    else entry.context = context;
     if (req.announce_seq !== undefined) entry.announce_seq = req.announce_seq;
     if (req.batch !== undefined) entry.batch = req.batch;
     if (req.paired_with !== undefined) {
@@ -518,20 +537,31 @@ export class Campaign {
     if (req.gm_degree !== undefined && (!Number.isInteger(req.gm_degree) || req.gm_degree < 0 || req.gm_degree > 3)) {
       err('gm_degree must be an integer from 0 to 3');
     }
-    this.cursor.set(key, position);
-    this.maxConcerned.set(key, Math.max(this.maxConcerned.get(key) ?? 0, position));
-    return { entry, roll: C.rollFromPreimage(p), used: { modifier } };
+    return {
+      entry, roll: C.rollFromPreimage(p),
+      used: { modifier: modifier!, context, dc: req.dc },
+      effect: { key, position, resolveAnnounce: req.announce_seq !== undefined },
+      plan,
+    };
   }
 
-  private storeDrawPrivates(built: any, req: any, resolvedModifier?: number): void {
-    const type = this.registry.get(req.check_type)!;
+  private applyDrawEffect(draft: PlannedDraw): void {
+    this.cursor.set(draft.effect.key, draft.effect.position);
+    this.maxConcerned.set(draft.effect.key,
+      Math.max(this.maxConcerned.get(draft.effect.key) ?? 0, draft.effect.position));
+    if (draft.effect.resolveAnnounce) this.openAnnounce = null;
+  }
+
+  private storeDrawPrivates(built: any, used: PlannedDraw['used']): void {
     const vals: SealedValues = {};
-    if (req.dc !== undefined && type.seal_dc) vals.dc = req.dc;
-    if ('mod_commit' in built) {
-      vals.modifier = resolvedModifier;
-    }
-    if ('context_commit' in built) vals.context = req.context ?? type.label;
+    if ('dc_commit' in built) vals.dc = used.dc;
+    if ('mod_commit' in built) vals.modifier = used.modifier;
+    if ('context_commit' in built) vals.context = used.context;
     if (Object.keys(vals).length) this.priv!.values[built.seq] = vals;
+  }
+
+  private hasModDirective(context: string): boolean {
+    return context.split(/\r\n|[\r\n\u2028\u2029]/).some((line) => /^@mod(?:\s|$)/u.test(line));
   }
 
   // ---- announces (§5.3, §7.3.4) --------------------------------------------
@@ -558,6 +588,7 @@ export class Campaign {
       const entry: any = { kind: 'announce', slot: req.slot, lane: type.lane, check_type: req.check_type, initiator };
       const context = req.context ?? type.label;
       if (typeof context !== 'string') err('context must be a string');
+      if (this.hasModDirective(context)) err('context must not contain an @mod directive');
       if (this.transcript.context_privacy === 'sealed') entry.context_commit = C.contextCommit(p, seq, context);
       else entry.context = context;
       const built = this.append(entry);
@@ -645,32 +676,55 @@ export class Campaign {
     });
   }
 
-  async sheetUpdate(req: { slot: string; effective_from: string; modifiers: Record<string, number> }) {
+  async sheetUpdate(req: { slot: string; effective_from?: string; modifiers: Record<string, number> }) {
     return this.mutate(() => {
       this.requireLive();
-      if (typeof req.effective_from !== 'string'
-          || !/^\d{4}-\d{2}-\d{2}$/.test(req.effective_from)
-          || !Number.isFinite(Date.parse(`${req.effective_from}T00:00:00Z`))
-          || new Date(`${req.effective_from}T00:00:00Z`).toISOString().slice(0, 10) !== req.effective_from) {
-        err('effective_from must be a real YYYY-MM-DD date');
-      }
-      if (!req.modifiers || typeof req.modifiers !== 'object'
-          || Object.entries(req.modifiers).some(([id, v]) => !this.registry.has(id) || !Number.isInteger(v))) {
-        err('modifiers must map known check types to integers');
+      if (!req.modifiers || typeof req.modifiers !== 'object' || Array.isArray(req.modifiers)
+          || Object.entries(req.modifiers).some(([name, v]) => !validProfileName(name) || !Number.isInteger(v))) {
+        err('modifiers must map valid profile names to integers');
       }
       const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
       if (!st.active || st.retired) err(`slot ${req.slot} is not active`);
       const role = st.role ?? this.priv!.labels[req.slot]?.role;
       if (role === 'player') {
+        if (typeof req.effective_from !== 'string'
+            || !/^\d{4}-\d{2}-\d{2}$/.test(req.effective_from)
+            || !Number.isFinite(Date.parse(`${req.effective_from}T00:00:00Z`))
+            || new Date(`${req.effective_from}T00:00:00Z`).toISOString().slice(0, 10) !== req.effective_from) {
+          err('effective_from must be a real YYYY-MM-DD date');
+        }
         const built = this.append({ kind: 'sheet-update', slot: req.slot, effective_from: req.effective_from, modifiers: req.modifiers });
         this.writePrivate(); this.writeLedger();
         return { entry: built, private: false };
       }
+      if ('effective_from' in req) err('effective_from is only valid for player sheets');
       // NPC/world sheets stay private; modifiers actually used in draws are
       // committed per draw and open through disclosure/final reveal (§7.5).
-      this.priv!.npc_sheets[req.slot] = { ...this.priv!.npc_sheets[req.slot], ...req.modifiers };
+      this.priv!.npc_sheets[req.slot] = { ...req.modifiers };
       this.writePrivate();
       return { entry: null, private: true };
+    });
+  }
+
+  async profileDefaults(req: { slot: string; defaults: Record<string, string> }) {
+    return this.mutate(() => {
+      this.requireLive();
+      const st = this.slots.get(req.slot) ?? err(`unknown slot ${req.slot}`);
+      if (!st.active || st.retired) err(`slot ${req.slot} is not active`);
+      const role = st.role ?? this.priv!.labels[req.slot]?.role ?? err(`no role known for ${req.slot}`);
+      if (!req.defaults || typeof req.defaults !== 'object' || Array.isArray(req.defaults)) {
+        err('defaults must map check types to profile names');
+      }
+      for (const [checkType, profile] of Object.entries(req.defaults)) {
+        const type = this.registry.get(checkType);
+        if (!type || !type.roles.includes(role) || !st.lanes.has(type.lane)) {
+          err(`check_type ${checkType} is not available to ${req.slot}`);
+        }
+        if (!validProfileName(profile)) err(`invalid profile name for ${checkType}`);
+      }
+      this.priv!.profile_defaults[req.slot] = { ...req.defaults };
+      this.writePrivate();
+      return { defaults: this.priv!.profile_defaults[req.slot] };
     });
   }
 
@@ -984,9 +1038,16 @@ export class Campaign {
       }
     }
     const sheets: any = {};
-    for (const e of this.entries) if (e.kind === 'sheet-update') sheets[e.slot] = { ...sheets[e.slot], ...e.modifiers };
+    const today = new Date(this.now()).toISOString().slice(0, 10);
+    for (const [slot, st] of this.slots) {
+      const role = st.role ?? this.priv!.labels[slot]?.role;
+      if (role !== 'player') continue;
+      const sheet = this.applicablePlayerSheet(slot, this.entries.length, today);
+      if (sheet) sheets[slot] = { ...sheet.modifiers };
+    }
     return {
       session: this.session, lanes, sheets, npc_sheets: this.priv!.npc_sheets,
+      profile_defaults: this.priv!.profile_defaults,
       // enough for /table to rebuild the ANNOUNCED state after a reload or a
       // failed reveal: an announcement is public and can only be resolved by
       // a draw or a void, so the UI must never lose its way back to it
@@ -1075,7 +1136,7 @@ export class Campaign {
     return t >= this.lastTs ? t : this.lastTs;
   }
 
-  private append(partial: Record<string, unknown>): any {
+  private append(partial: Record<string, unknown>, planned?: { seq: number; ts: string }): any {
     if (this.closed) err('the ledger is closed', 409);
     if (this.finalRevealed && partial.kind !== 'closed') err('only closed may follow final-reveal', 409);
     // guard on the public ledger tail, not private state: the adjacency
@@ -1084,8 +1145,12 @@ export class Campaign {
       err('the pending activation must complete before any other ledger entry', 409);
     }
     const seq = this.entries.length;
+    if (planned && planned.seq !== seq) err(`planned seq ${planned.seq} does not match append seq ${seq}`, 500);
     const prev = seq === 0 ? ZERO64 : this.entries[seq - 1].hash;
-    const entry: any = { seq, ts: this.ts(), session: partial.kind === 'genesis' ? 0 : this.session, ...partial, prev };
+    const entry: any = {
+      seq, ts: planned?.ts ?? this.ts(), session: partial.kind === 'genesis' ? 0 : this.session,
+      ...partial, prev,
+    };
     entry.hash = entryHash(entry);
     this.lastTs = entry.ts;
     this.entries.push(entry);
@@ -1184,12 +1249,19 @@ export class Campaign {
     const late = this.entries.find((e) => e.kind === 'dc-late' && e.target_seq === drawSeq);
     return late ? (late.dc ?? this.priv!.values[late.seq]?.dc) : undefined;
   }
-  private playerSheetMod(slot: string, checkType: string): number | undefined {
-    let v: number | undefined;
+  private applicablePlayerSheet(slot: string, beforeSeq: number, throughDate: string): any | undefined {
+    let best: any | undefined;
     for (const e of this.entries) {
-      if (e.kind === 'sheet-update' && e.slot === slot && e.modifiers?.[checkType] !== undefined) v = e.modifiers[checkType];
+      if (e.kind !== 'sheet-update' || e.slot !== slot || e.seq >= beforeSeq
+          || e.effective_from > throughDate) continue;
+      if (!best || e.effective_from > best.effective_from
+          || (e.effective_from === best.effective_from && e.seq > best.seq)) best = e;
     }
-    return v;
+    return best;
+  }
+
+  private playerSheetMod(slot: string, profile: string, beforeSeq: number, throughDate: string): number | undefined {
+    return this.applicablePlayerSheet(slot, beforeSeq, throughDate)?.modifiers?.[profile];
   }
 
   /**
@@ -1199,6 +1271,8 @@ export class Campaign {
    * the secret, so a ledger/secret mismatch is caught immediately.
    */
   private load(): void {
+    this.priv!.npc_sheets ??= {};
+    this.priv!.profile_defaults ??= {};
     // prune private orphans from a crash between private and ledger writes
     const text = existsSync(this.path('ledger.json')) ? readFileSync(this.path('ledger.json'), 'utf8') : null;
     if (text === null) { this.entries = []; return; }

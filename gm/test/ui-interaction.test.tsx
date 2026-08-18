@@ -9,7 +9,7 @@
  * actual handler; assertions read the server's ledger.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -60,17 +60,26 @@ beforeAll(async () => {
   await campaign.genesis(genesisInput);
   await campaign.sheetUpdate({
     slot: 'slot-01', effective_from: '2026-08-14',
-    modifiers: { 'rk-general': 5, 'perception-secret': 7, 'rk-cosmology': 4 },
+    modifiers: { Society: 5, Perception: 7, Occultism: 4 },
   });
+  await campaign.profileDefaults({ slot: 'slot-01', defaults: {
+    'rk-general': 'Society', 'perception-secret': 'Perception', 'rk-cosmology': 'Occultism',
+  } });
   await campaign.sheetUpdate({
     slot: 'slot-02', effective_from: '2026-08-14',
-    modifiers: { 'rk-general': 6, 'perception-secret': 5, 'rk-cosmology': 3 },
+    modifiers: { Society: 6, Perception: 5, Occultism: 3 },
   });
+  await campaign.profileDefaults({ slot: 'slot-02', defaults: {
+    'rk-general': 'Society', 'perception-secret': 'Perception', 'rk-cosmology': 'Occultism',
+  } });
   for (const [slot, modifier] of [['slot-03', 4], ['slot-04', 3], ['slot-05', 2]] as const) {
     await campaign.sheetUpdate({
       slot, effective_from: '2026-08-14',
-      modifiers: { 'rk-general': modifier, 'perception-secret': modifier, 'rk-cosmology': modifier },
+      modifiers: { Society: modifier, Perception: modifier, Occultism: modifier },
     });
+    await campaign.profileDefaults({ slot, defaults: {
+      'rk-general': 'Society', 'perception-secret': 'Perception', 'rk-cosmology': 'Occultism',
+    } });
   }
   await campaign.sessionOpen();
   server = createServer(campaign);
@@ -115,6 +124,7 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     const hotkey = chip.closest('button')!.querySelector('.keycap')!.textContent!;
     fireEvent.keyDown(window, { key: hotkey });
     expect(document.activeElement).toBe(document.body); // zero typing
+    expect(screen.getByTitle('from profile Society').textContent).toContain('Society +5');
 
     // ---- first draw
     fireEvent.keyDown(window, { key: 'Enter' });
@@ -174,36 +184,28 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     fireEvent.keyDown(document.querySelector('.overlay')!, { key: 'Enter' });
   }, 20_000);
 
-  it('a missing modifier is visible before Enter and fixable with one key', async () => {
+  it('a missing modifier is visible before Enter and the draw is refused', async () => {
     // A draw is refused outright without a modifier. Discovering that from
     // the error, mid-scene, is the failure this guards against: the armed
-    // bar has to say so first, and `m` has to fix it without leaving /table.
+    // bar has to say so first. Until session 2, `m` must fail safely rather
+    // than writing a destructive single-profile snapshot.
     // 9 arms the world's routine lane; the world has no sheet in this fixture
     fireEvent.keyDown(window, { key: '9' });
     await screen.findByText('world-routine');
 
     // the warning is on screen before anything is committed
-    const modChip = await screen.findByTitle(/no modifier recorded/);
+    const modChip = await screen.findByTitle(/no default profile modifier recorded/);
     expect(modChip.textContent).toContain('not set');
 
-    // pressing m opens the inline field; entering a value records the sheet
     const before = draws().length;
+    const beforeSheets = campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update').length;
     fireEvent.keyDown(window, { key: 'm' });
-    const input = await waitFor(() => {
-      const el = document.querySelector('.dcchip input') as HTMLInputElement;
-      expect(el).toBeTruthy();
-      return el;
-    });
-    fireEvent.keyDown(input, { key: 'Enter', target: { value: '6' } });
-    await waitFor(() => expect(screen.getByTitle('from the sheet').textContent).toContain('+6'));
-    expect(draws()).toHaveLength(before); // recording a modifier is not a draw
-
-    // and now the draw the GM originally wanted just works, one keystroke
+    await waitFor(() => expect(document.body.textContent).toContain('manual modifiers arrive with the session 2 profile picker'));
+    expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update')).toHaveLength(beforeSheets);
+    expect(document.querySelector('.dcchip input')).toBeNull();
     fireEvent.keyDown(window, { key: 'Enter' });
-    await waitFor(() => expect(draws()).toHaveLength(before + 1));
-    expect(draws().at(-1).slot).toBe('slot-10');
-    // world-routine seals its modifier, so the value is committed not published
-    expect(draws().at(-1).mod_commit).toMatch(/^[0-9a-f]{64}$/);
+    await waitFor(() => expect(document.body.textContent).toContain('no modifier recorded'));
+    expect(draws()).toHaveLength(before);
   }, 20_000);
   it('voiding clears the ANNOUNCED state instead of resurrecting it', async () => {
     // The resolution and the recovery effect race: the overlay closes while
@@ -267,6 +269,25 @@ describe('the /table keyboard (§7.3, criterion 4)', () => {
     expect(draws().at(-1).announce_seq).toBeDefined();
     expect(verifyLedger(campaign.ledgerJson()).failures).toEqual([]);
     fireEvent.keyDown(document.querySelector('.overlay')!, { key: 'Enter' });
+  }, 20_000);
+
+  it('/sheets preserves untouched player profiles and saves NPC maps without a date', async () => {
+    fireEvent.click(screen.getByText('sheets'));
+    const aliceHeading = await screen.findByText(/Alice/);
+    const alicePane = aliceHeading.closest('.pane') as HTMLElement;
+    fireEvent.change(within(alicePane).getByLabelText('rk-general'), { target: { value: '11' } });
+    fireEvent.click(within(alicePane).getByText('Save'));
+    await waitFor(() => {
+      const latest = campaign.ledgerJson().entries.filter((e: any) => e.kind === 'sheet-update' && e.slot === 'slot-01').at(-1);
+      expect(latest.modifiers).toEqual({ Society: 5, Perception: 7, Occultism: 4, 'rk-general': 11 });
+    });
+
+    const fennHeading = await screen.findByText(/Fenn/);
+    const fennPane = fennHeading.closest('.pane') as HTMLElement;
+    expect(within(fennPane).queryByLabelText('effective from')).toBeNull();
+    fireEvent.change(within(fennPane).getByLabelText('npc-open'), { target: { value: '4' } });
+    fireEvent.click(within(fennPane).getByText('Save'));
+    await waitFor(() => expect(campaign.tableState().npc_sheets['slot-06']).toEqual({ 'npc-open': 4 }));
   }, 20_000);
 
 });

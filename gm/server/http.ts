@@ -107,6 +107,7 @@ export function createServer(campaign: Campaign, opts: { idleLockMs?: number; no
     'POST /api/dc-late': (b) => campaign.dcLate(b),
     'POST /api/out-of-band': (b) => campaign.outOfBand(b),
     'POST /api/sheet-update': (b) => campaign.sheetUpdate(b),
+    'POST /api/profile-defaults': (b) => campaign.profileDefaults(b),
     'POST /api/retire-slot': (b) => campaign.retireSlot(b),
     'POST /api/note': (b) => campaign.note(b.text),
     'POST /api/activation/declare': (b) => campaign.activationDeclare(b),

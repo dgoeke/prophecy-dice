@@ -11,6 +11,7 @@
 import { canonicalBytes } from './canonical.ts';
 import * as C from './crypto.ts';
 import { entryHash, ZERO64, LEDGER_FORMAT } from './ledger.ts';
+import { validProfileName } from './profile.ts';
 
 const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -394,8 +395,8 @@ export function verifyLedger(file: any): VerifyResult {
           fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
         }
         if (!validDate(e.effective_from)
-            || !e.modifiers || typeof e.modifiers !== 'object'
-            || Object.entries(e.modifiers).some(([id, v]) => !registry.has(id) || !Number.isInteger(v))) {
+            || !e.modifiers || typeof e.modifiers !== 'object' || Array.isArray(e.modifiers)
+            || Object.entries(e.modifiers).some(([name, v]) => !validProfileName(name) || !Number.isInteger(v))) {
           fail(`structure: seq ${e.seq} malformed sheet-update`);
         }
         break;

@@ -294,6 +294,15 @@ const DEGREES = ['critical failure', 'failure', 'success', 'critical success'];
 const ZERO64 = '0'.repeat(64), FORMAT = 'wotw-column-ledger/4';
 const TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/, HEX64 = /^[0-9a-f]{64}$/;
 const LANE_RE = /^[a-z][a-z0-9-]{0,31}$/;
+const PROFILE_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const FORBIDDEN_PROFILE_NAMES = new Set([
+  'prototype', 'constructor', '__defineGetter__', '__defineSetter__',
+  'hasOwnProperty', '__lookupGetter__', '__lookupSetter__', 'isPrototypeOf',
+  'propertyIsEnumerable', 'toString', 'valueOf', '__proto__', 'toLocaleString',
+]);
+const validProfileName = v => typeof v === 'string' && v === v.trim()
+  && [...v].length >= 1 && [...v].length <= 64
+  && !PROFILE_CONTROL_RE.test(v) && !FORBIDDEN_PROFILE_NAMES.has(v);
 const KNOWN_CHAINS = {
   'drand:8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce': { genesis_time: 1595431050, period: 30 },
   'drand:52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971': { genesis_time: 1692803367, period: 3 },
@@ -519,7 +528,8 @@ async function verifyLedger(file, progress) {
       else if (st.role === null) pendingSheetUpdates.push({ seq: e.seq, slot: e.slot });
       else if (st.role !== 'player') fail(`structure: seq ${e.seq} sheet-update for non-player slot ${e.slot}`);
       if (!validDate(e.effective_from) || !e.modifiers || typeof e.modifiers !== 'object'
-          || Object.entries(e.modifiers).some(([id,v]) => !registry.has(id) || !isInt(v)))
+          || Array.isArray(e.modifiers)
+          || Object.entries(e.modifiers).some(([name,v]) => !validProfileName(name) || !isInt(v)))
         fail(`structure: seq ${e.seq} malformed sheet-update`);
       M.sheets.push(e);
     } else if (e.kind === 'check-type') {

@@ -133,7 +133,10 @@ describe('lifecycle', () => {
   it('precommit → genesis → sessions → draws → verifies in TS and Python', async () => {
     const { campaign, stateDir } = await makeCampaign();
     await campaign.sessionOpen();
-    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { 'rk-general': 5, 'perception-secret': 7, 'rk-cosmology': 4 } });
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5, Perception: 7, Occultism: 4 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: {
+      'rk-general': 'Society', 'perception-secret': 'Perception', 'rk-cosmology': 'Occultism',
+    } });
     const d1 = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', dc: 18, context: 'first check' });
     expect(d1.entry.position).toBe(1);
     expect(d1.entry.modifier).toBe(5); // auto-filled from the sheet (§7.5)
@@ -355,9 +358,11 @@ describe('ordered allocation (§9.2)', () => {
     await campaign.activationComplete();
     // one private sheet covering both an unsealed and a sealed NPC type
     await campaign.sheetUpdate({
-      slot: 'slot-04', effective_from: '2026-08-14',
-      modifiers: { 'public-gm-check': 2, 'npc-secret': 9 },
+      slot: 'slot-04', modifiers: { Diplomacy: 2, Deception: 9 },
     });
+    await campaign.profileDefaults({ slot: 'slot-04', defaults: {
+      'public-gm-check': 'Diplomacy', 'npc-secret': 'Deception',
+    } });
     await campaign.sessionOpen();
     const unsealed = await campaign.draw({ slot: 'slot-04', check_type: 'public-gm-check', dc: 12 });
     expect(unsealed.entry.modifier).toBe(2); // publishes in the clear
@@ -376,8 +381,9 @@ describe('ordered allocation (§9.2)', () => {
       .rejects.toThrow(/set it on \/sheets, or press m at the table/);
     // and the table's own one-key fix clears it for good
     await campaign.sheetUpdate({
-      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { 'perception-secret': 7 },
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Perception: 7 },
     });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'perception-secret': 'Perception' } });
     const d = await campaign.draw({ slot: 'slot-01', check_type: 'perception-secret', dc: 15 });
     expect(d.entry.modifier).toBe(7);
   });
@@ -395,8 +401,9 @@ describe('ordered allocation (§9.2)', () => {
     clock.advance(700 * 1000);
     await campaign.activationComplete();
     await campaign.sheetUpdate({
-      slot: 'slot-04', effective_from: '2026-08-14', modifiers: { 'rk-general': 9 },
+      slot: 'slot-04', effective_from: '2026-08-14', modifiers: { Society: 9 },
     });
+    await campaign.profileDefaults({ slot: 'slot-04', defaults: { 'rk-general': 'Society' } });
     await campaign.sessionOpen();
     const draw = await campaign.draw({
       slot: 'slot-04', check_type: 'rk-general', dc: 20, context: 'new player acts',
@@ -482,10 +489,18 @@ describe('idempotency (§9.2, §6.5)', () => {
 
   it('the same batch_id is idempotent as a unit', async () => {
     const { campaign } = await makeCampaign();
+    for (const [slot, modifier] of [['slot-01', 7], ['slot-02', 5]] as const) {
+      await campaign.sheetUpdate({ slot, effective_from: '2026-08-14', modifiers: { Perception: modifier } });
+      await campaign.profileDefaults({ slot, defaults: { 'perception-secret': 'Perception' } });
+    }
     await campaign.sessionOpen();
+    await expect(campaign.batch({
+      batch_id: 'overridden', check_type: 'perception-secret', dc: 15,
+      slots: [{ slot: 'slot-01', modifier: 7 } as any],
+    })).rejects.toThrow(/cannot override/);
     const req = {
       batch_id: 'batch-1', check_type: 'perception-secret', dc: 15,
-      slots: [{ slot: 'slot-01', modifier: 7 }, { slot: 'slot-02', modifier: 5 }],
+      slots: [{ slot: 'slot-01' }, { slot: 'slot-02' }],
     };
     const first = await campaign.batch(req);
     for (let i = 0; i < 50; i++) {
@@ -501,15 +516,195 @@ describe('idempotency (§9.2, §6.5)', () => {
 
   it('a failed batch consumes nothing (atomicity)', async () => {
     const { campaign } = await makeCampaign();
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Perception: 7 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'perception-secret': 'Perception' } });
     await campaign.sessionOpen();
     await expect(campaign.batch({
       batch_id: 'bad', check_type: 'perception-secret', dc: 15,
-      slots: [{ slot: 'slot-01', modifier: 7 }, { slot: 'slot-99', modifier: 5 }],
+      slots: [{ slot: 'slot-01' }, { slot: 'slot-99' }],
     })).rejects.toThrow(/unknown slot/);
     expect(campaign.ledgerJson().entries.filter((e: any) => e.kind === 'draw').length).toBe(0);
     // and the lane is not burned: the next draw takes position 1
     const d = await campaign.draw({ slot: 'slot-01', check_type: 'perception-secret', modifier: 7, dc: 15 });
     expect(d.entry.position).toBe(1);
+  });
+});
+
+describe('modifier profiles and planned draws', () => {
+  it('uses complete dated player snapshots and does not fall back after removal', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5, Occultism: 7 },
+    });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
+    await campaign.sessionOpen();
+    const first = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general', dc: 18 });
+    expect(first.modifier).toBe(5);
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Occultism: 9 },
+    });
+    expect(campaign.tableState().sheets['slot-01']).toEqual({ Occultism: 9 });
+    await expect(campaign.draw({ slot: 'slot-01', check_type: 'rk-general', dc: 18 }))
+      .rejects.toThrow(/no modifier recorded/);
+    const alternate = await campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', profile: 'Occultism', dc: 18,
+    });
+    expect(alternate.modifier).toBe(9);
+    expect(alternate.entry.position).toBe(2);
+  });
+
+  it('honors effective dates, same-date sequence order, and the strict draw-seq bound', async () => {
+    const { campaign, clock } = await makeCampaign();
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 9 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
+    await campaign.sessionOpen();
+    await expect(campaign.draw({ slot: 'slot-01', check_type: 'rk-general' })).rejects.toThrow(/no modifier recorded/);
+    clock.advance(24 * 3600 * 1000);
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 10 } });
+    const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general' });
+    expect(draw.modifier).toBe(10);
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 99 } });
+    expect((campaign as any).playerSheetMod('slot-01', 'Society', draw.entry.seq, '2026-08-15')).toBe(10);
+  });
+
+  it('replaces NPC maps, rejects dates, and keeps defaults private', async () => {
+    const { campaign, clock } = await makeCampaign();
+    await campaign.activationDeclare({ display: 'Vic', role: 'npc', lanes: ['open', 'deep'], nonce: 'n' });
+    clock.advance(700 * 1000);
+    await campaign.activationComplete();
+    await expect(campaign.sheetUpdate({
+      slot: 'slot-04', effective_from: '2026-08-14', modifiers: { Stealth: 8 },
+    })).rejects.toThrow(/only valid for player/);
+    await campaign.sheetUpdate({ slot: 'slot-04', modifiers: { Stealth: 8, Diplomacy: 3 } });
+    await campaign.profileDefaults({ slot: 'slot-04', defaults: {
+      'npc-secret': 'Stealth', 'public-gm-check': 'Diplomacy',
+    } });
+    expect(campaign.tableState().profile_defaults['slot-04']['npc-secret']).toBe('Stealth');
+    expect(JSON.stringify(campaign.ledgerJson())).not.toContain('Stealth');
+    await campaign.sheetUpdate({ slot: 'slot-04', modifiers: { Diplomacy: 4 } });
+    expect(campaign.tableState().npc_sheets['slot-04']).toEqual({ Diplomacy: 4 });
+    await campaign.sessionOpen();
+    await expect(campaign.draw({ slot: 'slot-04', check_type: 'npc-secret', dc: 18 }))
+      .rejects.toThrow(/no modifier recorded/);
+  });
+
+  it('rejects malformed profile names at both server write boundaries', async () => {
+    const { campaign } = await makeCampaign();
+    for (const name of ['', ' padded', 'x'.repeat(65), '__proto__', 'constructor', 'prototype', 'bad\nname']) {
+      const modifiers = Object.fromEntries([[name, 4]]);
+      await expect(campaign.sheetUpdate({
+        slot: 'slot-01', effective_from: '2026-08-14', modifiers,
+      }), JSON.stringify(name)).rejects.toThrow(/valid profile names/);
+      const defaults = Object.fromEntries([['rk-general', name]]);
+      await expect(campaign.profileDefaults({ slot: 'slot-01', defaults }), JSON.stringify(name))
+        .rejects.toThrow(/invalid profile name/);
+    }
+  });
+
+  it('enforces override exclusivity and composes canonical attributable contexts', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sheetUpdate({
+      slot: 'slot-01', effective_from: '2026-08-14', modifiers: { 'Lore "Roots"': 6 },
+    });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Lore "Roots"' } });
+    await campaign.sessionOpen();
+    await expect(campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', profile: 'Lore "Roots"', modifier: 6,
+    })).rejects.toThrow(/mutually exclusive/);
+    await expect(campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', context: 'question\n@mod manual',
+    })).rejects.toThrow(/must not contain/);
+    await expect(campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', context: 'question\u2028@mod "Wrong"',
+    })).rejects.toThrow(/must not contain/);
+    const profiled = await campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', context: '  remembered trail  \n\t', dc: 17,
+    });
+    const manual = await campaign.draw({
+      slot: 'slot-01', check_type: 'rk-general', modifier: 8, context: 'manual check', dc: 17,
+    });
+    const preview = campaign.disclosePreview('slot-01', 'sealed', 2);
+    expect(preview.draws[0].context).toBe('  remembered trail\n@mod "Lore \\"Roots\\""');
+    expect(preview.draws[1].context).toBe('manual check\n@mod manual');
+    expect(profiled.entry.context_commit).toMatch(/^[0-9a-f]{64}$/);
+    expect(manual.entry.context_commit).toMatch(/^[0-9a-f]{64}$/);
+    await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 2 });
+    expect(verifyLedger(campaign.ledgerJson()).verdict).toBe('VERIFIED');
+  });
+
+  it('rejects directives in announce context without opening an announcement', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sessionOpen();
+    await expect(campaign.announce({
+      slot: 'slot-01', check_type: 'rk-cosmology', context: 'purpose\n@mod "Society"',
+    })).rejects.toThrow(/must not contain/);
+    expect(campaign.tableState().open_announce).toBeNull();
+  });
+
+  it('reads the clock once so resolution date and draw timestamp cannot diverge', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5 } });
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-15', modifiers: { Society: 9 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
+    await campaign.sessionOpen();
+    let reads = 0;
+    (campaign as any).now = () => {
+      reads++;
+      return Date.parse(reads === 1 ? '2026-08-14T23:59:59Z' : '2026-08-15T00:00:01Z');
+    };
+    const draw = await campaign.draw({ slot: 'slot-01', check_type: 'rk-general' });
+    expect(reads).toBe(1);
+    expect(draw.entry.ts).toBe('2026-08-14T23:59:59Z');
+    expect(draw.modifier).toBe(5);
+  });
+
+  it('plans batch sequences and reopens each sealed context byte-identically', async () => {
+    const { campaign } = await makeCampaign();
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5 } });
+    await campaign.sheetUpdate({ slot: 'slot-02', effective_from: '2026-08-14', modifiers: { Occultism: 7 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } });
+    await campaign.profileDefaults({ slot: 'slot-02', defaults: { 'rk-general': 'Occultism' } });
+    await campaign.sessionOpen();
+    const batch = await campaign.batch({
+      batch_id: 'planned', check_type: 'rk-general', dc: 20, context: 'shared question',
+      slots: [{ slot: 'slot-01' }, { slot: 'slot-02' }],
+    });
+    expect(batch.entries.map((e) => e.seq)).toEqual([batch.entries[0].seq, batch.entries[0].seq + 1]);
+    expect(new Set(batch.entries.map((e) => e.ts)).size).toBe(1);
+    await campaign.disclose({ slot: 'slot-01', lane: 'sealed', through_position: 1 });
+    await campaign.disclose({ slot: 'slot-02', lane: 'sealed', through_position: 1 });
+    const opened = campaign.ledgerJson().entries.filter((e: any) => e.kind === 'disclose')
+      .flatMap((e: any) => e.opened).filter((e: any) => 'context' in e);
+    expect(opened.map((e: any) => e.context)).toEqual([
+      'shared question\n@mod "Society"', 'shared question\n@mod "Occultism"',
+    ]);
+    expect(verifyLedger(campaign.ledgerJson()).verdict).toBe('VERIFIED');
+  });
+
+  it('leaves all batch state untouched when a later member lacks a profile', async () => {
+    const { campaign, stateDir } = await makeCampaign();
+    await campaign.sheetUpdate({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Perception: 7 } });
+    await campaign.profileDefaults({ slot: 'slot-01', defaults: { 'perception-secret': 'Perception' } });
+    await campaign.sessionOpen();
+    const beforeEntries = campaign.ledgerJson().entries.length;
+    const beforePrivate = readFileSync(join(stateDir, 'private.enc'), 'utf8');
+    const beforeCursor = new Map((campaign as any).cursor);
+    const beforeConcerned = new Map((campaign as any).maxConcerned);
+    await expect(campaign.batch({
+      batch_id: 'missing', check_type: 'perception-secret', dc: 18,
+      slots: [{ slot: 'slot-01' }, { slot: 'slot-02' }],
+    })).rejects.toThrow(/no modifier recorded/);
+    expect(campaign.ledgerJson().entries.length).toBe(beforeEntries);
+    expect(readFileSync(join(stateDir, 'private.enc'), 'utf8')).toBe(beforePrivate);
+    expect(new Map((campaign as any).cursor)).toEqual(beforeCursor);
+    expect(new Map((campaign as any).maxConcerned)).toEqual(beforeConcerned);
+    await campaign.sheetUpdate({ slot: 'slot-02', effective_from: '2026-08-14', modifiers: { Perception: 5 } });
+    await campaign.profileDefaults({ slot: 'slot-02', defaults: { 'perception-secret': 'Perception' } });
+    const retry = await campaign.batch({
+      batch_id: 'retry', check_type: 'perception-secret', dc: 18,
+      slots: [{ slot: 'slot-01' }, { slot: 'slot-02' }],
+    });
+    expect(retry.entries.map((e) => e.position)).toEqual([1, 1]);
   });
 });
 
@@ -572,10 +767,22 @@ describe('lock state over HTTP (§6.4, §9.2)', () => {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
       });
       expect(unauthorized.status).toBe(401);
+      const sheet = await fetch(`${base}/api/sheet-update`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
+        body: JSON.stringify({ slot: 'slot-01', effective_from: '2026-08-14', modifiers: { Society: 5 } }),
+      });
+      expect(sheet.status).toBe(200);
+      const defaults = await fetch(`${base}/api/profile-defaults`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
+        body: JSON.stringify({ slot: 'slot-01', defaults: { 'rk-general': 'Society' } }),
+      });
+      expect(defaults.status).toBe(200);
       const draw = await fetch(`${base}/api/draw`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
-        body: JSON.stringify({ slot: 'slot-01', check_type: 'rk-general', modifier: 5, dc: 12, context: 'via http' }),
+        body: JSON.stringify({ slot: 'slot-01', check_type: 'rk-general', dc: 12, context: 'via http' }),
       });
       expect(draw.status).toBe(200);
       expect((await draw.json()).roll).toBeGreaterThanOrEqual(1);

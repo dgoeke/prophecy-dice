@@ -6,9 +6,9 @@
  * (routine / deep purpose); a lowercase letter arms a check type scoped to
  * the armed slot's role; Enter draws. Arming is sticky, so repeating the
  * same check is Enter alone. `b` arms a party-wide batch, `d` edits the DC,
- * `m` records the missing modifier without leaving the table, `.` veils
- * results and NPC names, `U` corrects the last draw, `O`/`C` open and close
- * the session, `P` publishes.
+ * `m` is reserved for the pending manual/profile picker added in session 2;
+ * `.` veils results and NPC names, `U` corrects the last draw, `O`/`C` open
+ * and close the session, and `P` publishes.
  *
  * Sealed results live only in this component's memory: after a refresh they
  * are gone, and recovering them requires the logged reveal-all (criterion 9).
@@ -49,7 +49,6 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
   const [armed, setArmed] = useState<{ slot: string | null; type: string | null; batch: boolean }>({ slot: null, type: null, batch: false });
   const [dc, setDc] = useState<number | null>(null);
   const [dcEditing, setDcEditing] = useState(false);
-  const [modEditing, setModEditing] = useState(false);
   const [pinSaving, setPinSaving] = useState(false);
   // the last announcement seq the server was observed to be holding open
   const seenAnnounce = useRef<number | null>(null);
@@ -144,28 +143,6 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
     }
   }, [players, npcs, bench, world, registry, typeById]);
 
-  /**
-   * Record the armed slot's modifier for the armed check type. Player slots
-   * write a public sheet-update; NPC and world values stay private until
-   * reveal (§7.5). Sent as a single-key map so it merges with what is there.
-   */
-  const saveModifier = useCallback(async (raw: string) => {
-    const v = parseInt(raw, 10);
-    if (!Number.isFinite(v)) { setModEditing(false); return say('enter a whole number'); }
-    if (!armed.slot || !armed.type) { setModEditing(false); return; }
-    try {
-      await api('/api/sheet-update', {
-        slot: armed.slot,
-        effective_from: new Date().toISOString().slice(0, 10),
-        modifiers: { [armed.type]: v },
-      });
-      setModEditing(false);
-      await refreshTable();
-      onChange();
-      say(`${armed.type} ${v >= 0 ? `+${v}` : v} recorded`);
-    } catch (e: any) { setModEditing(false); say(e.message); }
-  }, [armed, refreshTable, onChange]);
-
   const fire = useCallback(async () => {
     if (!armed.slot || !armed.type) { say('arm a slot and a check type first'); return; }
     const type = typeById[armed.type];
@@ -187,7 +164,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         // an announcement is public and can only be resolved by a draw or a
         // void, so never write one we already know the draw will refuse
         if (armedModifier === undefined) {
-          say('no modifier recorded — press m before announcing');
+          say('no default profile modifier recorded — fix it on /sheets before announcing');
           return;
         }
         setOverlay({ mode: 'context', slot: armed.slot, typeId: type.id });
@@ -230,8 +207,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
         }
         if (e.key === 'd') { setDcEditing(true); return true; }
         if (e.key === 'm') {
-          if (armed.slot && armed.type) setModEditing(true);
-          else say('arm a slot and a check type first');
+          say('manual modifiers arrive with the session 2 profile picker — edit saved profiles on /sheets');
           return true;
         }
         if (e.key === 'U') { setOverlay({ mode: 'correct' }); return true; }
@@ -256,9 +232,17 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
   if (!table) return <p className="dim">reaching the table…</p>;
 
   const armedType = armed.type ? typeById[armed.type] : null;
-  // mirrors the server's sourcing: by the slot's role, not the seal flag
-  const modifierFor = (slot: SlotInfo, typeId: string): number | undefined =>
-    (slot.role === 'player' ? table.sheets : table.npc_sheets)[slot.id]?.[typeId];
+  const defaultProfileFor = (slot: SlotInfo, typeId: string): string | undefined =>
+    table.profile_defaults[slot.id]?.[typeId];
+  // Mirrors server resolution: check type → private default pointer → the
+  // role-appropriate profile map. The check type never keys the sheet itself.
+  const modifierFor = (slot: SlotInfo, typeId: string): number | undefined => {
+    const profile = defaultProfileFor(slot, typeId);
+    return profile === undefined ? undefined
+      : (slot.role === 'player' ? table.sheets : table.npc_sheets)[slot.id]?.[profile];
+  };
+  const armedProfile: string | undefined = armedSlot && armed.type
+    ? defaultProfileFor(armedSlot, armed.type) : undefined;
   const armedModifier: number | undefined = armedSlot && armed.type
     ? modifierFor(armedSlot, armed.type) : undefined;
   // a batch is atomic: one player's missing modifier refuses the whole thing,
@@ -362,17 +346,11 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           // visible before Enter rather than discovered by the error.
           <span className={'typechip dcchip' + (armedModifier === undefined ? ' armed' : '')}>
             <span className="keycap">m</span>mod{' '}
-            {modEditing
-              ? <input autoFocus defaultValue={armedModifier ?? ''} onBlur={() => setModEditing(false)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') { void saveModifier((e.target as HTMLInputElement).value); }
-                    if (e.key === 'Escape') setModEditing(false);
-                  }} />
-              : <button className={'btn ghost' + (armedModifier === undefined ? ' rubric' : '')}
-                  title={armedModifier === undefined ? 'no modifier recorded — a draw will be refused' : 'from the sheet'}
-                  onClick={() => setModEditing(true)}>
-                  {armedModifier === undefined ? 'not set' : (armedModifier >= 0 ? `+${armedModifier}` : armedModifier)}
-                </button>}
+            <button className={'btn ghost' + (armedModifier === undefined ? ' rubric' : '')}
+              title={armedModifier === undefined ? 'no default profile modifier recorded — a draw will be refused' : `from profile ${armedProfile}`}
+              onClick={() => say('edit saved profiles and defaults on /sheets')}>
+              {armedModifier === undefined ? 'not set' : `${armedProfile} ${armedModifier >= 0 ? `+${armedModifier}` : armedModifier}`}
+            </button>
           </span>
         )}
         {armedSlot && (
@@ -391,7 +369,7 @@ export function Table({ status, onChange }: { status: Status & { session_open?: 
           <span className="flash">batch needs a modifier for {batchMissing.join(', ')}</span>
         )}
         {flash && <span className="flash">{flash}</span>}
-        <span className="hint">Enter draws{armedType?.ritual ? ' → announce' : ''} · m mod · d DC · b batch · . veil · U correct · C close &amp; publish</span>
+        <span className="hint">Enter draws{armedType?.ritual ? ' → announce' : ''} · m reserved · d DC · b batch · . veil · U correct · C close &amp; publish</span>
       </div>
 
       {overlay && <OverlayHost overlay={overlay} setOverlay={setOverlay} table={table} status={status}
